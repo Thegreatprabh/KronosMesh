@@ -1,13 +1,14 @@
-//! eBPF/XDP fast-path loader with a full userspace fallback.
+//! eBPF/XDP capability probe with a userspace data plane.
 //!
 //! On Linux the loader probes the environment (kernel, BPF filesystem,
 //! privileges), validates a supplied eBPF object (ELF header + e_machine
 //! == EM_BPF), and attempts a real `bpf()` syscall program load of a
-//! minimal XDP program. If any step is unavailable — non-Linux OS,
-//! container without CAP_BPF, no object supplied — the daemon runs its
-//! userspace UDP data plane and reports exactly why. The data plane is
-//! fully functional in both modes; the fast path only changes *where*
-//! packets are filtered, never *whether* the mesh works.
+//! minimal XDP program. The probe answers one question — *could* this
+//! host run an XDP fast path — and reports exactly what it found. In
+//! this release all packet processing runs in the userspace UDP data
+//! plane regardless of the probe verdict; a kernel fast path is roadmap
+//! work, and the status reporting says so (mode stays
+//! UserspaceFallback, `enabled` stays false).
 //!
 //! Telemetry counters and the event ring buffer live here and are shared
 //! with the tunnel.
@@ -86,7 +87,10 @@ impl EventRing {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataPlaneMode {
+    /// Kernel XDP fast path. Reserved for the roadmap fast path; never
+    /// constructed in this release (the probe confirms capability only).
     FastPath,
+    /// All packets processed by the userspace data plane.
     UserspaceFallback,
 }
 
@@ -257,18 +261,28 @@ impl EbpfLoader {
             match linux_bpf::try_load_xdp_probe() {
                 Ok(fd) => {
                     linux_bpf::close_fd(fd);
-                    let reason = "kernel accepted the XDP probe program; \
-                                  fast-path filtering active"
+                    // The probe program is closed immediately and never
+                    // attached: capability is confirmed, but this release
+                    // filters nothing in the kernel. Report exactly that -
+                    // an earlier version claimed "fast-path filtering
+                    // active" here, which was not true.
+                    let reason = "kernel accepted the XDP probe program \
+                                  (capability confirmed); data plane is \
+                                  userspace in this release - kernel fast \
+                                  path is roadmap"
                         .to_string();
-                    ring.push("ebpf: fast path available".to_string());
-                    return EbpfStatus {
-                        mode: DataPlaneMode::FastPath,
-                        enabled: true,
+                    ring.push(
+                        "ebpf: probe ok (capability confirmed); userspace data plane"
+                            .to_string(),
+                    );
+                    EbpfStatus {
+                        mode: DataPlaneMode::UserspaceFallback,
+                        enabled: false,
                         reason,
                         kernel,
                         object_path: object_path.map(|s| s.to_string()),
                         object_validated,
-                    };
+                    }
                 }
                 Err(errno) => {
                     let reason = format!(
@@ -277,14 +291,14 @@ impl EbpfLoader {
                          CAP_BPF/CAP_NET_ADMIN"
                     );
                     ring.push(format!("ebpf: fallback engaged ({reason})"));
-                    return EbpfStatus {
+                    EbpfStatus {
                         mode: DataPlaneMode::UserspaceFallback,
                         enabled: false,
                         reason,
                         kernel,
                         object_path: object_path.map(|s| s.to_string()),
                         object_validated,
-                    };
+                    }
                 }
             }
         }

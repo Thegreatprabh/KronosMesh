@@ -290,8 +290,8 @@ async fn run_peers(cfg: Config) -> Result<()> {
         .await
         .context("fetching topology from the control plane")?;
     println!(
-        "{:<18} {:<15} {:<22} {:<8} {:<6} {}",
-        "NAME", "VIRTUAL IP", "ENDPOINT", "ROLE", "STATE", "FINGERPRINT"
+        "{:<18} {:<15} {:<22} {:<8} {:<6} FINGERPRINT",
+        "NAME", "VIRTUAL IP", "ENDPOINT", "ROLE", "STATE"
     );
     for node in &topo.nodes {
         println!(

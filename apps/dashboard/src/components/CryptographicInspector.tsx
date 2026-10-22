@@ -45,7 +45,7 @@ export default function CryptographicInspector({ node }: Props) {
             </div>
             <p className="mt-1 font-mono text-xs text-slate-500">
               {node.virtual_ip} · {node.endpoint} · NAT {node.nat_type} ·{' '}
-              {node.ebpf_enabled ? 'eBPF XDP fast path' : 'userspace data plane'}
+              {node.ebpf_enabled ? 'eBPF reported by node (legacy)' : 'userspace data plane'}
             </p>
           </div>
 

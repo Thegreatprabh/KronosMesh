@@ -1,4 +1,4 @@
-FROM rust:1.79-slim AS build
+FROM rust:1.87-slim AS build
 WORKDIR /src
 COPY core/daemon/Cargo.toml core/daemon/Cargo.lock* ./core/daemon/
 COPY core/daemon/src ./core/daemon/src

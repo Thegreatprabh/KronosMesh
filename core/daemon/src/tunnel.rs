@@ -63,6 +63,8 @@ const PING_EVERY: Duration = Duration::from_secs(10);
 
 pub trait Transport: Send + Sync + 'static {
     fn local_addr(&self) -> SocketAddr;
+    // RPITIT form (not async fn) on purpose: callers spawn these futures
+    // onto tokio tasks, so the + Send bound is part of the contract.
     fn send_to<'a>(
         &'a self,
         buf: &'a [u8],
@@ -88,6 +90,7 @@ impl Transport for UdpTransport {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn send_to<'a>(
         &'a self,
         buf: &'a [u8],
@@ -96,6 +99,7 @@ impl Transport for UdpTransport {
         self.socket.send_to(buf, addr)
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
@@ -106,8 +110,14 @@ impl Transport for UdpTransport {
 
 /// A shared in-memory switchboard for tests: transports register an
 /// address and receive datagrams addressed to them.
+/// Datagram queue endpoints keyed by listen address (MemoryHub state).
+type HubNodes = HashMap<SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>>;
+
+/// Application payloads delivered by a tunnel: (source virtual IP, bytes).
+pub type AppRx = mpsc::Receiver<(String, Vec<u8>)>;
+
 pub struct MemoryHub {
-    nodes: std::sync::Mutex<HashMap<SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+    nodes: std::sync::Mutex<HubNodes>,
 }
 
 impl MemoryHub {
@@ -133,6 +143,7 @@ impl Transport for MemoryTransport {
         self.addr
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn send_to<'a>(
         &'a self,
         buf: &'a [u8],
@@ -149,6 +160,7 @@ impl Transport for MemoryTransport {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
@@ -161,10 +173,7 @@ impl Transport for MemoryTransport {
                     buf[..n].copy_from_slice(&data[..n]);
                     Ok((n, from))
                 }
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "hub closed",
-                )),
+                None => Err(std::io::Error::other("hub closed")),
             }
         }
     }
@@ -210,7 +219,6 @@ pub struct Tunnel<T: Transport> {
     transport: Arc<T>,
     identity: Arc<Identity>,
     local_vip: [u8; 4],
-    local_vip_str: String,
     peers: Mutex<HashMap<String, Arc<Peer>>>,
     by_index: Mutex<HashMap<u32, String>>,
     routes: Mutex<HashMap<[u8; 4], String>>,
@@ -275,7 +283,7 @@ impl<T: Transport> Tunnel<T> {
         local_role: &str,
         telemetry: Arc<TelemetryCounters>,
         ring: Arc<EventRing>,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<(String, Vec<u8>)>)> {
+    ) -> Result<(Arc<Self>, AppRx)> {
         let octets = vip_to_octets(local_vip)
             .ok_or_else(|| anyhow!("invalid virtual ip {local_vip}"))?;
         let (app_tx, app_rx) = mpsc::channel(1024);
@@ -283,7 +291,6 @@ impl<T: Transport> Tunnel<T> {
             transport: Arc::new(transport),
             identity: Arc::new(identity),
             local_vip: octets,
-            local_vip_str: local_vip.to_string(),
             peers: Mutex::new(HashMap::new()),
             by_index: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),

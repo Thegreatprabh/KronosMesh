@@ -45,7 +45,7 @@ impl ControlClient {
             .context("register request failed")?
             .error_for_status()
             .context("control plane rejected registration")?;
-        Ok(resp.json().await.context("decoding register response")?)
+        resp.json().await.context("decoding register response")
     }
 
     pub async fn heartbeat(
@@ -70,7 +70,7 @@ impl ControlClient {
             .context("heartbeat request failed")?
             .error_for_status()
             .context("control plane rejected heartbeat")?;
-        Ok(resp.json().await.context("decoding heartbeat response")?)
+        resp.json().await.context("decoding heartbeat response")
     }
 
     pub async fn fetch_acls(&self) -> Result<AclPolicyResponse> {
@@ -82,7 +82,7 @@ impl ControlClient {
             .context("ACL fetch failed")?
             .error_for_status()
             .context("control plane rejected ACL fetch")?;
-        Ok(resp.json().await.context("decoding ACL response")?)
+        resp.json().await.context("decoding ACL response")
     }
 
     pub async fn fetch_topology(&self) -> Result<MeshTopology> {
@@ -94,7 +94,7 @@ impl ControlClient {
             .context("topology fetch failed")?
             .error_for_status()
             .context("control plane rejected topology fetch")?;
-        Ok(resp.json().await.context("decoding topology response")?)
+        resp.json().await.context("decoding topology response")
     }
 }
 
