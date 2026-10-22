@@ -1569,6 +1569,22 @@ impl<T: Transport> Tunnel<T> {
         }
     }
 
+    /// Answers a frame that arrived for a stream this node has
+    /// already reset: the peer has not heard (our RESET was lost
+    /// on the unreliable transport) and is still retransmitting
+    /// into the stream. One fresh RESET per stray frame — the
+    /// same rule TCP applies to segments for a closed socket —
+    /// makes a lost RESET self-healing instead of a permanent
+    /// wedge: the peer's retransmissions keep re-offering us the
+    /// chance to tell it the stream is gone.
+    async fn reply_reset(&self, src_vip: &str, stream_id: u32) {
+        if let Some(octets) = vip_to_octets(src_vip) {
+            let _ = self
+                .send_inner(octets, KIND_STREAM_RESET, &stream_id.to_be_bytes())
+                .await;
+        }
+    }
+
     /// Handles one decrypted stream frame addressed to this node.
     /// Malformed frames are dropped silently. ACKs are sent from
     /// here (and from `next_stream_data` when consumption advances
@@ -1594,6 +1610,11 @@ impl<T: Transport> Tunnel<T> {
                     return;
                 }
                 let stream = self.in_stream(&src, stream_id);
+                let stream_dead = { stream.state.lock().unwrap().dead };
+                if stream_dead {
+                    self.reply_reset(&src, stream_id).await;
+                    return;
+                }
                 let needs_emit = {
                     let mut st = stream.state.lock().unwrap();
                     st.last_activity = Instant::now();
@@ -1641,6 +1662,11 @@ impl<T: Transport> Tunnel<T> {
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
                 let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
                 let stream = self.in_stream(&src, stream_id);
+                let stream_dead = { stream.state.lock().unwrap().dead };
+                if stream_dead {
+                    self.reply_reset(&src, stream_id).await;
+                    return;
+                }
                 let (next_expected, close_complete, open_confirmed) = {
                     let mut st = stream.state.lock().unwrap();
                     st.last_activity = Instant::now();
@@ -1694,6 +1720,11 @@ impl<T: Transport> Tunnel<T> {
                     // ack reports the true completion status and
                     // the sender's retransmissions converge.
                     let stream = self.in_stream(&src, stream_id);
+                    let stream_dead = { stream.state.lock().unwrap().dead };
+                    if stream_dead {
+                        self.reply_reset(&src, stream_id).await;
+                        return;
+                    }
                     let (next_expected, close_complete, open_confirmed) = {
                         let mut st = stream.state.lock().unwrap();
                         st.last_activity = Instant::now();
@@ -3499,6 +3530,103 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(10), sender)
             .await
             .expect("blocked sender was not woken by the reset")
+            .unwrap();
+        assert!(result.is_err(), "send on a reset stream must fail");
+    }
+
+    /// A RESET is sent exactly once, and on an unreliable
+    /// transport it can be lost. The blocked sender must still
+    /// be woken: its retransmitted DATA frames draw a fresh
+    /// RESET out of the receiver (the stray-segment rule), so
+    /// the loss heals within a few retransmission rounds
+    /// instead of wedging the stream forever. The drop budget
+    /// below deterministically kills the original RESET (and
+    /// the first heal attempts), leaving the heal as the only
+    /// path that can wake the sender.
+    #[tokio::test]
+    async fn stream_lost_reset_heals_via_retransmitted_data() {
+        let hub = MemoryHub::new();
+        let mk = |port: u16, vip: &'static str, role: &'static str, seed: u64| {
+            let dir = std::env::temp_dir().join(format!(
+                "kronos-reset-loss-{}-{}",
+                std::process::id(),
+                vip.replace('.', "-")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let transport = ChaosTransport::wrap(hub.register(addr(port)), seed, 10, 5);
+            let handle = transport.clone();
+            let (tunnel, rx) = Tunnel::bind_with_transport(
+                transport,
+                Identity::load_or_create(&dir).unwrap(),
+                vip,
+                role,
+                Arc::new(TelemetryCounters::default()),
+                Arc::new(EventRing::new(64)),
+            )
+            .unwrap();
+            tunnel.update_acls(&[crate::wire::AclRule {
+                id: "test-allow-all".to_string(),
+                source_role: "*".to_string(),
+                dest_service: "*".to_string(),
+                port: 0,
+                action: "ALLOW".to_string(),
+                priority: 1,
+            }]);
+            let _ = &rx;
+            (tunnel, handle, Identity::load_or_create(&dir).unwrap())
+        };
+        let (a, _a_transport, id_a) = mk(6531, "100.64.27.1", "edge", 0xA5A5_1234);
+        let (b, b_transport, id_b) = mk(6532, "100.64.27.2", "node", 0x5A5A_9876);
+        let mut rx_b = b
+            .take_stream_receiver()
+            .expect("stream receiver must be available once");
+        let a = Arc::new(a);
+        let b = Arc::new(b);
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.27.2",
+            Some(b.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.27.1",
+            Some(a.local_addr()),
+            "edge",
+        );
+        a.spawn_loops();
+        b.spawn_loops();
+
+        a.send_stream_open("100.64.27.2", 9, "bulk", 9000)
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(10), rx_b.recv())
+            .await
+            .expect("open event timed out")
+            .expect("stream event channel closed");
+        assert!(matches!(opened, StreamEvent::Open { stream_id: 9, .. }));
+
+        // Nobody consumes at B: the 512 KB send blocks on the
+        // full window, exactly like the plain reset test.
+        let big = pattern(512_000, 5);
+        let send_a = a.clone();
+        let sender =
+            tokio::spawn(async move { send_a.send_stream_data("100.64.27.2", 9, &big).await });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !sender.is_finished(),
+            "send must block on a full window instead of dropping bytes"
+        );
+
+        // Kill B's next 64 sends: the RESET below is among the
+        // first of them, and the budget also eats the first
+        // heal attempts — only a heal that outlives the budget
+        // can wake the sender.
+        b_transport.drop_next_sends(64);
+        b.reset_stream("100.64.27.1", 9).await;
+        let result = tokio::time::timeout(Duration::from_secs(15), sender)
+            .await
+            .expect("blocked sender was not woken: the lost reset never healed")
             .unwrap();
         assert!(result.is_err(), "send on a reset stream must fail");
     }
