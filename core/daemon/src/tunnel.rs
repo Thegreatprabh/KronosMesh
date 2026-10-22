@@ -39,6 +39,18 @@ pub const KIND_PONG: u8 = 0x02;
 pub const KIND_DATA: u8 = 0x03;
 
 const HANDSHAKE_WAIT: Duration = Duration::from_millis(3000);
+/// Hop limit stamped on inner packets; relays decrement it and drop at
+/// zero, so a routing loop dies instead of circulating forever.
+const DEFAULT_TTL: u8 = 8;
+/// Initiator-side session rotation interval (WireGuard-style rekeying).
+const REKEY_AFTER_SECS: u64 = 120;
+/// Maximum accepted age of a handshake INIT timestamp. Bounds the replay
+/// window even across responder restarts (floors are also persisted).
+const INIT_MAX_AGE_MS: u64 = 120_000;
+/// Per-source INIT processing budget per second. Reading an INIT costs
+/// two X25519 DH operations before the sender is authenticated, so
+/// unauthenticated floods are capped cheaply, before any DH happens.
+const INIT_RATE_LIMIT: u32 = 30;
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(20);
 const PING_EVERY: Duration = Duration::from_secs(10);
 
@@ -160,8 +172,17 @@ impl Transport for MemoryTransport {
 
 enum PeerState {
     Idle,
-    AwaitingResponse { initiator: Option<HandshakeInitiator>, local_index: u32 },
-    Established { session: Session, local_index: u32, remote_index: u32 },
+    AwaitingResponse {
+        initiator: Option<HandshakeInitiator>,
+        local_index: u32,
+        since: Instant,
+    },
+    Established {
+        session: Session,
+        local_index: u32,
+        remote_index: u32,
+        since: Instant,
+    },
 }
 
 struct Peer {
@@ -178,6 +199,13 @@ struct Peer {
     last_activity: Mutex<Instant>,
 }
 
+/// On-disk INIT freshness state (see Tunnel::set_freshness_dir).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct FreshnessFile {
+    self_last_init_ms: u64,
+    peers: HashMap<String, u64>,
+}
+
 pub struct Tunnel<T: Transport> {
     transport: Arc<T>,
     identity: Arc<Identity>,
@@ -191,6 +219,12 @@ pub struct Tunnel<T: Transport> {
     acl_rules: Mutex<Vec<AclRule>>,
     local_role: String,
     last_init_ms: Mutex<u64>,
+    rekey_after_secs: std::sync::atomic::AtomicU64,
+    /// Persisted per-peer INIT freshness floors (survive restarts).
+    init_floors: Mutex<HashMap<String, u64>>,
+    freshness_file: Mutex<Option<std::path::PathBuf>>,
+    /// Per-source INIT rate-limit windows (pre-auth DoS guard).
+    init_rate: Mutex<HashMap<SocketAddr, (Instant, u32)>>,
     app_tx: mpsc::Sender<(String, Vec<u8>)>,
     started: Instant,
 }
@@ -258,6 +292,10 @@ impl<T: Transport> Tunnel<T> {
             acl_rules: Mutex::new(Vec::new()),
             local_role: local_role.to_string(),
             last_init_ms: Mutex::new(0),
+            rekey_after_secs: std::sync::atomic::AtomicU64::new(REKEY_AFTER_SECS),
+            init_floors: Mutex::new(HashMap::new()),
+            freshness_file: Mutex::new(None),
+            init_rate: Mutex::new(HashMap::new()),
             app_tx,
             started: Instant::now(),
         });
@@ -295,10 +333,49 @@ impl<T: Transport> Tunnel<T> {
     /// enforce strictly increasing timestamps per peer, so the initiator
     /// guarantees them even across rapid successive handshakes.
     fn next_init_ts(&self) -> u64 {
-        let mut last = self.last_init_ms.lock().unwrap();
-        let ts = now_millis().max(*last + 1);
-        *last = ts;
+        let ts = {
+            let mut last = self.last_init_ms.lock().unwrap();
+            let ts = now_millis().max(*last + 1);
+            *last = ts;
+            ts
+        };
+        self.persist_freshness();
         ts
+    }
+
+    /// Points the tunnel at a state directory for INIT-freshness
+    /// persistence and seeds both monotonic clocks from disk. Without
+    /// this, a restart would forget the accepted-timestamp floors: a
+    /// captured INIT could be replayed at a fresh responder, and our own
+    /// clock could sit behind a responder's floor after a backward step.
+    pub fn set_freshness_dir(&self, dir: &std::path::Path) {
+        let path = dir.join("freshness.json");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(f) = serde_json::from_str::<FreshnessFile>(&text) {
+                {
+                    let mut last = self.last_init_ms.lock().unwrap();
+                    *last = (*last).max(f.self_last_init_ms);
+                }
+                *self.init_floors.lock().unwrap() = f.peers;
+            }
+        }
+        *self.freshness_file.lock().unwrap() = Some(path);
+    }
+
+    fn persist_freshness(&self) {
+        let path = match self.freshness_file.lock().unwrap().clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let self_ts = *self.last_init_ms.lock().unwrap();
+        let peers = self.init_floors.lock().unwrap().clone();
+        let f = FreshnessFile {
+            self_last_init_ms: self_ts,
+            peers,
+        };
+        if let Ok(text) = serde_json::to_string(&f) {
+            let _ = std::fs::write(&path, text);
+        }
     }
 
     // -- peer table -----------------------------------------------------------
@@ -320,29 +397,42 @@ impl<T: Transport> Tunnel<T> {
             Some(o) => o,
             None => return,
         };
-        let mut peers = self.peers.lock().unwrap();
-        if let Some(existing) = peers.get(public_hex) {
-            if let Some(ep) = endpoint {
-                *existing.endpoint.lock().unwrap() = Some(ep);
+        // LOCK DISCIPLINE (whole file): a tunnel-level lock (peers,
+        // routes, by_index, ...) is never held while acquiring another
+        // one. An earlier version nested peers->routes here and
+        // routes->peers in peer_by_vip - a classic ABBA deadlock when a
+        // heartbeat peer-sync raced a data packet.
+        let is_new = {
+            let mut peers = self.peers.lock().unwrap();
+            if let Some(existing) = peers.get(public_hex) {
+                if let Some(ep) = endpoint {
+                    *existing.endpoint.lock().unwrap() = Some(ep);
+                }
+                *existing.role.lock().unwrap() = role.to_string();
+                false
+            } else {
+                let peer = Arc::new(Peer {
+                    public: PublicKey::from(arr),
+                    public_hex: public_hex.to_string(),
+                    role: Mutex::new(role.to_string()),
+                    vip: octets,
+                    endpoint: Mutex::new(endpoint),
+                    state: Mutex::new(PeerState::Idle),
+                    last_init_ms: Mutex::new(0),
+                    latency_ms: Mutex::new(0.0),
+                    last_activity: Mutex::new(Instant::now()),
+                });
+                peers.insert(public_hex.to_string(), peer);
+                true
             }
-            *existing.role.lock().unwrap() = role.to_string();
-            self.routes.lock().unwrap().insert(octets, public_hex.to_string());
-            return;
+        };
+        self.routes
+            .lock()
+            .unwrap()
+            .insert(octets, public_hex.to_string());
+        if is_new {
+            self.ring.push(format!("peer added: {} ({})", public_hex, vip));
         }
-        let peer = Arc::new(Peer {
-            public: PublicKey::from(arr),
-            public_hex: public_hex.to_string(),
-            role: Mutex::new(role.to_string()),
-            vip: octets,
-            endpoint: Mutex::new(endpoint),
-            state: Mutex::new(PeerState::Idle),
-            last_init_ms: Mutex::new(0),
-            latency_ms: Mutex::new(0.0),
-            last_activity: Mutex::new(Instant::now()),
-        });
-        peers.insert(public_hex.to_string(), peer);
-        self.routes.lock().unwrap().insert(octets, public_hex.to_string());
-        self.ring.push(format!("peer added: {} ({})", public_hex, vip));
     }
 
     /// Syncs the peer table from a control-plane peer list (heartbeat
@@ -362,18 +452,32 @@ impl<T: Transport> Tunnel<T> {
         self.peers.lock().unwrap().len()
     }
 
-    pub fn connected_peer_count(&self) -> u32 {
-        let peers = self.peers.lock().unwrap();
+    /// Public keys of peers with established encrypted sessions; the
+    /// control plane renders topology links from these reports.
+    pub fn established_peer_keys(&self) -> Vec<String> {
+        let peers: Vec<Arc<Peer>> =
+            self.peers.lock().unwrap().values().cloned().collect();
         peers
-            .values()
+            .iter()
+            .filter(|p| matches!(*p.state.lock().unwrap(), PeerState::Established { .. }))
+            .map(|p| p.public_hex.clone())
+            .collect()
+    }
+
+    pub fn connected_peer_count(&self) -> u32 {
+        let peers: Vec<Arc<Peer>> =
+            self.peers.lock().unwrap().values().cloned().collect();
+        peers
+            .iter()
             .filter(|p| matches!(*p.state.lock().unwrap(), PeerState::Established { .. }))
             .count() as u32
     }
 
     pub fn avg_latency_ms(&self) -> f64 {
-        let peers = self.peers.lock().unwrap();
+        let peers: Vec<Arc<Peer>> =
+            self.peers.lock().unwrap().values().cloned().collect();
         let vals: Vec<f64> = peers
-            .values()
+            .iter()
             .map(|p| *p.latency_ms.lock().unwrap())
             .filter(|v| *v > 0.0)
             .collect();
@@ -385,15 +489,14 @@ impl<T: Transport> Tunnel<T> {
     }
 
     fn peer_by_vip(&self, vip: &[u8; 4]) -> Option<Arc<Peer>> {
-        let routes = self.routes.lock().unwrap();
-        let key = routes.get(vip)?;
-        self.peers.lock().unwrap().get(key).cloned()
+        // Two separate, sequential lock acquisitions (see add_peer).
+        let key = self.routes.lock().unwrap().get(vip).cloned()?;
+        self.peers.lock().unwrap().get(&key).cloned()
     }
 
     fn peer_by_index(&self, index: u32) -> Option<Arc<Peer>> {
-        let by_index = self.by_index.lock().unwrap();
-        let key = by_index.get(&index)?;
-        self.peers.lock().unwrap().get(key).cloned()
+        let key = self.by_index.lock().unwrap().get(&index).cloned()?;
+        self.peers.lock().unwrap().get(&key).cloned()
     }
 
     // -- zero-trust ACL enforcement -------------------------------------
@@ -464,6 +567,7 @@ impl<T: Transport> Tunnel<T> {
             *state = PeerState::AwaitingResponse {
                 initiator: Some(initiator),
                 local_index,
+                since: Instant::now(),
             };
         }
         let endpoint = peer
@@ -481,12 +585,72 @@ impl<T: Transport> Tunnel<T> {
     }
 
     async fn ensure_session(&self, peer: &Arc<Peer>) -> Result<()> {
-        let needs_init = {
-            let state = peer.state.lock().unwrap();
-            if matches!(*state, PeerState::Established { .. }) {
-                return Ok(());
+        // One retry around the single-attempt helper: if the first attempt
+        // timed out and left a stale AwaitingResponse behind (its INIT or
+        // the answering RESP was lost), reset it and initiate again rather
+        // than wedging the peer until restart.
+        for attempt in 0..2 {
+            match self.ensure_session_once(peer).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt == 0 {
+                        let stale = {
+                            let state = peer.state.lock().unwrap();
+                            matches!(
+                                &*state,
+                                PeerState::AwaitingResponse { since, .. }
+                                    if since.elapsed() > HANDSHAKE_WAIT
+                            )
+                        };
+                        if stale {
+                            *peer.state.lock().unwrap() = PeerState::Idle;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
             }
-            matches!(*state, PeerState::Idle)
+        }
+        Err(anyhow!(
+            "handshake with {} did not complete",
+            peer.public_hex
+        ))
+    }
+
+    async fn ensure_session_once(&self, peer: &Arc<Peer>) -> Result<()> {
+        let needs_init = {
+            let mut state = peer.state.lock().unwrap();
+            match &mut *state {
+                PeerState::Established { session, since, local_index, .. } => {
+                    if session.initiator
+                        && since.elapsed()
+                            > Duration::from_secs(
+                                self.rekey_after_secs.load(Ordering::Relaxed),
+                            )
+                    {
+                        // Rekey: retire the old session index and fall
+                        // through to a fresh handshake with new keys.
+                        let old = *local_index;
+                        *state = PeerState::Idle;
+                        drop(state);
+                        self.by_index.lock().unwrap().remove(&old);
+                        true
+                    } else {
+                        return Ok(());
+                    }
+                }
+                PeerState::Idle => true,
+                PeerState::AwaitingResponse { since, .. } => {
+                    if since.elapsed() > HANDSHAKE_WAIT {
+                        // The INIT or its RESP was lost; reset instead of
+                        // wedging this peer in AwaitingResponse forever.
+                        *state = PeerState::Idle;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
         };
         if needs_init {
             self.initiate_handshake(peer).await?;
@@ -512,7 +676,24 @@ impl<T: Transport> Tunnel<T> {
     /// Seals and sends an inner packet toward `dst_vip` (direct peer or
     /// via the routing table's next hop).
     pub async fn send_inner(&self, dst_vip: [u8; 4], kind: u8, body: &[u8]) -> Result<()> {
-        if kind == KIND_DATA {
+        self.send_inner_full(dst_vip, kind, body, self.local_vip, DEFAULT_TTL)
+            .await
+    }
+
+    /// Inner wire format: kind(1) | ttl(1) | src_vip(4) | dst_vip(4) |
+    /// body. The source address and TTL travel inside the encrypted
+    /// packet, so relays forward with the ORIGINAL source intact (the
+    /// receiver evaluates ACLs against the sender, not the relay) and
+    /// loops die when the TTL runs out.
+    async fn send_inner_full(
+        &self,
+        dst_vip: [u8; 4],
+        kind: u8,
+        body: &[u8],
+        src_vip: [u8; 4],
+        ttl: u8,
+    ) -> Result<()> {
+        if kind == KIND_DATA && src_vip == self.local_vip {
             if let Some(rule) = self.acl_denied_for(&self.local_role) {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                 self.ring.push(format!(
@@ -529,8 +710,10 @@ impl<T: Transport> Tunnel<T> {
             .peer_by_vip(&dst_vip)
             .ok_or_else(|| anyhow!("no route to {}", octets_to_vip(&dst_vip)))?;
         self.ensure_session(&peer).await?;
-        let mut inner = Vec::with_capacity(5 + body.len());
+        let mut inner = Vec::with_capacity(10 + body.len());
         inner.push(kind);
+        inner.push(ttl);
+        inner.extend_from_slice(&src_vip);
         inner.extend_from_slice(&dst_vip);
         inner.extend_from_slice(body);
         let (counter, remote_index, ciphertext) = {
@@ -640,6 +823,12 @@ impl<T: Transport> Tunnel<T> {
             if established {
                 let vip = peer.vip;
                 let _ = self.send_inner(vip, KIND_PING, &now_millis().to_le_bytes()).await;
+            } else if peer.endpoint.lock().unwrap().is_some() {
+                // Proactively build the mesh: a node in `up` mode
+                // establishes sessions with every known peer instead of
+                // waiting for application traffic, so the topology's
+                // encrypted links reflect reality.
+                let _ = self.ensure_session(&peer).await;
             }
         }
     }
@@ -662,6 +851,23 @@ impl<T: Transport> Tunnel<T> {
     async fn handle_init(&self, frame: &[u8], from: SocketAddr) {
         if frame.len() < 8 {
             return;
+        }
+        // Pre-auth rate limit (see INIT_RATE_LIMIT).
+        {
+            let mut rl = self.init_rate.lock().unwrap();
+            if rl.len() > 4096 {
+                let now = Instant::now();
+                rl.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(2));
+            }
+            let e = rl.entry(from).or_insert((Instant::now(), 0));
+            if Instant::now().duration_since(e.0) > Duration::from_secs(1) {
+                *e = (Instant::now(), 0);
+            }
+            e.1 += 1;
+            if e.1 > INIT_RATE_LIMIT {
+                self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
         let sender_index = u32::from_le_bytes(frame[4..8].try_into().unwrap());
         let msg1 = &frame[8..];
@@ -703,17 +909,57 @@ impl<T: Transport> Tunnel<T> {
                 .push("handshake init timestamp too far in the future".to_string());
             return;
         }
+        if init_ts + INIT_MAX_AGE_MS < now_millis() {
+            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+            self.ring
+                .push("handshake init too old (max age exceeded)".to_string());
+            return;
+        }
         {
+            // The effective floor merges the in-memory value with the
+            // persisted one, so a restart cannot reopen the replay window.
+            let floor = self
+                .init_floors
+                .lock()
+                .unwrap()
+                .get(&peer.public_hex)
+                .copied()
+                .unwrap_or(0);
             let mut last = peer.last_init_ms.lock().unwrap();
-            if init_ts <= *last {
+            let effective = (*last).max(floor);
+            if init_ts <= effective {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                 self.ring.push(format!(
-                    "stale or replayed handshake init from {} (ts {init_ts} <= last {})",
-                    peer.public_hex, *last
+                    "stale or replayed handshake init from {} (ts {init_ts} <= last {effective})",
+                    peer.public_hex
                 ));
                 return;
             }
             *last = init_ts;
+        }
+        self.init_floors
+            .lock()
+            .unwrap()
+            .insert(peer.public_hex.clone(), init_ts);
+        self.persist_freshness();
+        // Simultaneous initiation tie-break: if we also have a handshake
+        // in flight to this peer, exactly one initiation may win or the
+        // two crossed handshakes yield mismatched sessions. The smaller
+        // public key's initiation wins, deterministically on both sides.
+        {
+            let mut state = peer.state.lock().unwrap();
+            if let PeerState::AwaitingResponse { local_index, .. } = &*state {
+                if self.identity.public_hex() < peer.public_hex {
+                    // Our initiation wins; ignore this INIT entirely.
+                    return;
+                }
+                // Their initiation wins: abandon ours (retiring its index)
+                // and continue below as the responder.
+                let abandoned = *local_index;
+                *state = PeerState::Idle;
+                drop(state);
+                self.by_index.lock().unwrap().remove(&abandoned);
+            }
         }
         let local_index = self.next_index();
         let (msg2, session) = match responder.write_message2(&[]) {
@@ -723,18 +969,24 @@ impl<T: Transport> Tunnel<T> {
                 return;
             }
         };
-        {
+        let replaced_index = {
             let mut state = peer.state.lock().unwrap();
-            if let PeerState::Established { local_index: old, .. } = &*state {
-                // Retire the replaced session's index so stale frames can
-                // no longer resolve to this peer.
-                self.by_index.lock().unwrap().remove(old);
-            }
+            let old = match &*state {
+                PeerState::Established { local_index, .. } => Some(*local_index),
+                _ => None,
+            };
             *state = PeerState::Established {
                 session,
                 local_index,
                 remote_index: sender_index,
+                since: Instant::now(),
             };
+            old
+        };
+        if let Some(old) = replaced_index {
+            // Retire the replaced session's index so stale frames can no
+            // longer resolve to this peer.
+            self.by_index.lock().unwrap().remove(&old);
         }
         self.by_index
             .lock()
@@ -770,7 +1022,7 @@ impl<T: Transport> Tunnel<T> {
         };
         let msg2 = &frame[12..];
         let mut state = peer.state.lock().unwrap();
-        if let PeerState::AwaitingResponse { initiator, local_index } = &mut *state {
+        if let PeerState::AwaitingResponse { initiator, local_index, .. } = &mut *state {
             if *local_index != receiver_index {
                 return;
             }
@@ -782,6 +1034,7 @@ impl<T: Transport> Tunnel<T> {
                             session,
                             local_index: li,
                             remote_index: sender_index,
+                            since: Instant::now(),
                         };
                         self.telemetry
                             .handshakes_completed
@@ -836,15 +1089,16 @@ impl<T: Transport> Tunnel<T> {
         // peer's endpoint (NAT rebinding keeps working, spoofing does not).
         *peer.endpoint.lock().unwrap() = Some(from);
         *peer.last_activity.lock().unwrap() = Instant::now();
-        if plain.len() < 5 {
+        if plain.len() < 10 {
             return;
         }
         let kind = plain[0];
-        let dst_vip: [u8; 4] = plain[1..5].try_into().unwrap();
-        let body = plain[5..].to_vec();
+        let ttl = plain[1];
+        let src_vip: [u8; 4] = plain[2..6].try_into().unwrap();
+        let dst_vip: [u8; 4] = plain[6..10].try_into().unwrap();
+        let body = plain[10..].to_vec();
         match kind {
             KIND_PING => {
-                let src_vip = peer.vip;
                 let _ = self.send_inner(src_vip, KIND_PONG, &body).await;
             }
             KIND_PONG => {
@@ -855,7 +1109,13 @@ impl<T: Transport> Tunnel<T> {
                 }
             }
             KIND_DATA => {
-                let src_role = peer.role.lock().unwrap().clone();
+                // Policy is evaluated against the ORIGINAL sender's role,
+                // not the relaying peer's: relaying must not launder a
+                // denied role's identity through a middle node.
+                let src_role = self
+                    .peer_by_vip(&src_vip)
+                    .map(|p| p.role.lock().unwrap().clone())
+                    .unwrap_or_else(|| peer.role.lock().unwrap().clone());
                 if let Some(rule) = self.acl_denied_for(&src_role) {
                     self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                     self.ring.push(format!(
@@ -865,15 +1125,25 @@ impl<T: Transport> Tunnel<T> {
                     return;
                 }
                 if dst_vip == self.local_vip {
-                    let src = octets_to_vip(&peer.vip);
+                    let src = octets_to_vip(&src_vip);
                     let _ = self.app_tx.send((src, body)).await;
                 } else {
-                    // Mesh relay: forward toward the destination's next hop.
+                    // Mesh relay: forward toward the destination's next
+                    // hop, preserving the original source and decrementing
+                    // the TTL so loops die.
+                    if ttl <= 1 {
+                        self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                        self.ring
+                            .push("relay: TTL expired, packet dropped".to_string());
+                        return;
+                    }
                     let tunnel = self;
                     let body_clone = body.clone();
                     if let Some(next_hop) = tunnel.peer_by_vip(&dst_vip) {
                         if next_hop.public_hex != peer.public_hex {
-                            let _ = tunnel.send_inner(dst_vip, KIND_DATA, &body_clone).await;
+                            let _ = tunnel
+                                .send_inner_full(dst_vip, KIND_DATA, &body_clone, src_vip, ttl - 1)
+                                .await;
                         }
                     } else {
                         self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -975,11 +1245,13 @@ mod tests {
         b.spawn_loops();
         c.spawn_loops();
         a.send_data("100.64.0.13", b"relayed payload").await.unwrap();
-        let (_src, payload) = tokio::time::timeout(Duration::from_secs(5), rx_c.recv())
+        let (src, payload) = tokio::time::timeout(Duration::from_secs(5), rx_c.recv())
             .await
             .expect("relay timed out")
             .expect("channel closed");
         assert_eq!(payload, b"relayed payload");
+        // The receiver sees the ORIGINAL sender, not the relay (B).
+        assert_eq!(src, "100.64.0.11");
     }
 
     #[tokio::test]
@@ -994,6 +1266,243 @@ mod tests {
         let res = stranger.send_data("100.64.0.21", b"intruder").await;
         assert!(res.is_err());
         assert_eq!(a.connected_peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_initiation_converges() {
+        let hub = MemoryHub::new();
+        let (a, mut rx_a, id_a, _t) = make_node(&hub, 6301, "100.64.0.41", "edge").await;
+        let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6302, "100.64.0.42", "db").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.42", Some(b.local_addr()), "db");
+        b.add_peer(&id_a.public_hex(), "100.64.0.41", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        // Both sides initiate at the same time; the tie-break must leave
+        // exactly one working session, with traffic flowing both ways.
+        let (ra, rb) = tokio::join!(
+            a.send_data("100.64.0.42", b"from a"),
+            b.send_data("100.64.0.41", b"from b"),
+        );
+        ra.unwrap();
+        rb.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"from a");
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_a.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"from b");
+    }
+
+    #[tokio::test]
+    async fn stale_awaiting_response_is_retried() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6311, "100.64.0.51", "edge").await;
+        let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6312, "100.64.0.52", "db").await;
+        // A does not know B's endpoint yet: the first send must fail...
+        a.add_peer(&id_b.public_hex(), "100.64.0.52", None, "db");
+        b.add_peer(&id_a.public_hex(), "100.64.0.51", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        assert!(a.send_data("100.64.0.52", b"too early").await.is_err());
+        // ...but the peer must not stay wedged: once the endpoint is
+        // known, a retry resets the stale attempt and completes.
+        a.add_peer(&id_b.public_hex(), "100.64.0.52", Some(b.local_addr()), "db");
+        a.send_data("100.64.0.52", b"second attempt").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"second attempt");
+    }
+
+    #[tokio::test]
+    async fn session_rekeys_when_stale() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6321, "100.64.0.61", "edge").await;
+        let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6322, "100.64.0.62", "db").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.62", Some(b.local_addr()), "db");
+        b.add_peer(&id_a.public_hex(), "100.64.0.61", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        a.send_data("100.64.0.62", b"before rekey").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"before rekey");
+        let index_before = {
+            let peer = {
+                let peers = a.peers.lock().unwrap();
+                peers.get(&id_b.public_hex()).unwrap().clone()
+            };
+            let state = peer.state.lock().unwrap();
+            match &*state {
+                PeerState::Established { local_index, .. } => *local_index,
+                _ => panic!("not established"),
+            }
+        };
+        // Force every session to count as stale, then send again: the
+        // initiator must rotate to a fresh session (new index) and the
+        // packet must still arrive.
+        a.rekey_after_secs.store(0, Ordering::Relaxed);
+        a.send_data("100.64.0.62", b"after rekey").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"after rekey");
+        let index_after = {
+            let peer = {
+                let peers = a.peers.lock().unwrap();
+                peers.get(&id_b.public_hex()).unwrap().clone()
+            };
+            let state = peer.state.lock().unwrap();
+            match &*state {
+                PeerState::Established { local_index, .. } => *local_index,
+                _ => panic!("not established"),
+            }
+        };
+        assert_ne!(index_before, index_after, "rekey must rotate the session index");
+    }
+
+    #[tokio::test]
+    async fn relay_ttl_expiry_drops_packet() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6331, "100.64.0.11", "node").await;
+        let (b, _rx_b, id_b, _t2) = make_node(&hub, 6332, "100.64.0.12", "node").await;
+        let (c, mut rx_c, id_c, _t3) = make_node(&hub, 6333, "100.64.0.13", "node").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.12", Some(b.local_addr()), "node");
+        b.add_peer(&id_a.public_hex(), "100.64.0.11", Some(a.local_addr()), "node");
+        b.add_peer(&id_c.public_hex(), "100.64.0.13", Some(c.local_addr()), "node");
+        c.add_peer(&id_b.public_hex(), "100.64.0.12", Some(b.local_addr()), "node");
+        a.spawn_loops();
+        b.spawn_loops();
+        c.spawn_loops();
+        // Establish the A-B session first.
+        a.send_data("100.64.0.12", b"warmup").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Hand-craft inner packets sealed with the A->B session, destined
+        // for C, with a chosen TTL.
+        let craft_frame = |a: &Arc<Tunnel<MemoryTransport>>, ttl: u8, body: &[u8]| -> Vec<u8> {
+            let mut inner = vec![KIND_DATA, ttl];
+            inner.extend_from_slice(&[100, 64, 0, 11]); // src = A
+            inner.extend_from_slice(&[100, 64, 0, 13]); // dst = C
+            inner.extend_from_slice(body);
+            let peer = {
+                let peers = a.peers.lock().unwrap();
+                peers
+                    .values()
+                    .find(|p| p.vip == [100, 64, 0, 12])
+                    .unwrap()
+                    .clone()
+            };
+            let mut state = peer.state.lock().unwrap();
+            let (counter, remote_index, ct) = match &mut *state {
+                PeerState::Established { session, remote_index, .. } => {
+                    let (c, ct) = session.seal(&inner).unwrap();
+                    (c, *remote_index, ct)
+                }
+                _ => panic!("A-B session not established"),
+            };
+            let mut frame = vec![MSG_DATA, 0, 0, 0];
+            frame.extend_from_slice(&remote_index.to_le_bytes());
+            frame.extend_from_slice(&counter.to_le_bytes());
+            frame.extend_from_slice(&ct);
+            frame
+        };
+
+        // TTL 1: B must drop it instead of forwarding.
+        let f1 = craft_frame(&a, 1, b"must die at relay");
+        b.handle_frame(&f1, a.local_addr()).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), rx_c.recv())
+                .await
+                .is_err(),
+            "TTL-expired packet must not be relayed"
+        );
+
+        // TTL 2: B forwards (with TTL 1) and C receives it, sourced from A.
+        let f2 = craft_frame(&a, 2, b"relayed with ttl to spare");
+        b.handle_frame(&f2, a.local_addr()).await;
+        let (src, payload) = tokio::time::timeout(Duration::from_secs(5), rx_c.recv())
+            .await
+            .expect("relay timed out")
+            .expect("channel closed");
+        assert_eq!(payload, b"relayed with ttl to spare");
+        assert_eq!(src, "100.64.0.11");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sync_and_traffic_do_not_deadlock() {
+        // Regression test for the ABBA lock-order inversion: add_peer took
+        // peers->routes while peer_by_vip took routes->peers. Hammering
+        // peer-sync, session lookups, and sends concurrently must finish.
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6401, "100.64.0.71", "edge").await;
+        let (b, _rx_b, id_b, _t2) = make_node(&hub, 6402, "100.64.0.72", "db").await;
+        let hex_a = id_a.public_hex();
+        let hex_b = id_b.public_hex();
+        let addr_a = a.local_addr();
+        let addr_b = b.local_addr();
+        a.add_peer(&hex_b, "100.64.0.72", Some(addr_b), "db");
+        b.add_peer(&hex_a, "100.64.0.71", Some(addr_a), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        a.send_data("100.64.0.72", b"warmup").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let work = async {
+            let t1 = {
+                let b = b.clone();
+                let hex_a = hex_a.clone();
+                tokio::spawn(async move {
+                    for _ in 0..300 {
+                        b.add_peer(&hex_a, "100.64.0.71", Some(addr_a), "edge");
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let t2 = {
+                let a = a.clone();
+                let hex_b = hex_b.clone();
+                tokio::spawn(async move {
+                    for _ in 0..300 {
+                        a.add_peer(&hex_b, "100.64.0.72", Some(addr_b), "db");
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let t3 = {
+                let b = b.clone();
+                tokio::spawn(async move {
+                    for _ in 0..100 {
+                        let _ = b.send_data("100.64.0.71", b"churn").await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let t4 = {
+                let a = a.clone();
+                let b = b.clone();
+                tokio::spawn(async move {
+                    for _ in 0..300 {
+                        let _ = b.established_peer_keys();
+                        let _ = b.connected_peer_count();
+                        let _ = a.established_peer_keys();
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let _ = tokio::join!(t1, t2, t3, t4);
+        };
+        tokio::time::timeout(Duration::from_secs(20), work)
+            .await
+            .expect("deadlock: concurrent sync/traffic did not finish in 20s");
     }
 
     #[tokio::test]

@@ -25,6 +25,10 @@ pub struct NodeRegisterResponse {
     pub node_id: String,
     pub assigned_virtual_ip: String,
     pub peers: Vec<PeerNode>,
+    /// Bearer credential issued by the control plane at first
+    /// registration (or rotated by an admin). Absent on re-registrations.
+    #[serde(default)]
+    pub node_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,6 +59,9 @@ pub struct HeartbeatPayload {
     pub peers_connected: u32,
     pub avg_latency_ms: f64,
     pub uptime_secs: u64,
+    /// Public keys of peers with established encrypted sessions; the
+    /// control plane uses this to render truthful topology links.
+    pub established_peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

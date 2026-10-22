@@ -30,14 +30,48 @@ export async function fetchAcls(): Promise<AclPolicyResponse> {
   return getJson<AclPolicyResponse>('/api/v1/acls');
 }
 
+// The control plane gates ACL changes behind KRONOS_ADMIN_TOKEN when one
+// is configured. The operator pastes it once in the ACL panel; it is kept
+// in localStorage and sent as a bearer token on mutations only.
+const ADMIN_TOKEN_KEY = 'kronos-admin-token';
+
+export function getAdminToken(): string {
+  try {
+    return localStorage.getItem(ADMIN_TOKEN_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function setAdminToken(token: string): void {
+  try {
+    if (token) {
+      localStorage.setItem(ADMIN_TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(ADMIN_TOKEN_KEY);
+    }
+  } catch {
+    // storage unavailable (private mode); mutations will surface the 401
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const t = getAdminToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
 export async function createAcl(rule: Omit<AclRule, 'id'>): Promise<AclRule> {
   const resp = await fetch(`${CONTROL_URL}/api/v1/acls`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ ...rule, id: '' }),
   });
   if (!resp.ok) {
-    throw new Error(`create ACL returned ${resp.status}`);
+    throw new Error(
+      resp.status === 401
+        ? 'create ACL returned 401 - the control plane requires an admin token (set it in the ACL panel)'
+        : `create ACL returned ${resp.status}`,
+    );
   }
   return (await resp.json()) as AclRule;
 }
@@ -45,9 +79,14 @@ export async function createAcl(rule: Omit<AclRule, 'id'>): Promise<AclRule> {
 export async function deleteAcl(id: string): Promise<void> {
   const resp = await fetch(`${CONTROL_URL}/api/v1/acls/${id}`, {
     method: 'DELETE',
+    headers: { ...authHeaders() },
   });
   if (!resp.ok) {
-    throw new Error(`delete ACL returned ${resp.status}`);
+    throw new Error(
+      resp.status === 401
+        ? 'delete ACL returned 401 - the control plane requires an admin token (set it in the ACL panel)'
+        : `delete ACL returned ${resp.status}`,
+    );
   }
 }
 

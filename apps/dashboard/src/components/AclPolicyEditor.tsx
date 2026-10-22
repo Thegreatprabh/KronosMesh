@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { CheckCircle2, Plus, Shield, Trash2 } from 'lucide-react';
 import type { AclPolicyResponse, AclRule } from '../types/mesh';
+import { getAdminToken, setAdminToken } from '../lib/api';
 
 interface Props {
   policy: AclPolicyResponse;
@@ -21,6 +22,14 @@ export default function AclPolicyEditor({ policy, roles, readOnly, onCreate, onD
   const [priority, setPriority] = useState(50);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [token, setToken] = useState(() => getAdminToken());
+  const [tokenSaved, setTokenSaved] = useState(false);
+
+  const saveToken = () => {
+    setAdminToken(token.trim());
+    setTokenSaved(true);
+    window.setTimeout(() => setTokenSaved(false), 2000);
+  };
 
   const draft: Omit<AclRule, 'id'> = useMemo(
     () => ({
@@ -62,6 +71,26 @@ export default function AclPolicyEditor({ policy, roles, readOnly, onCreate, onD
           policy v{policy.version}
         </span>
       </h2>
+      {!readOnly && (
+        <div className="mb-3 flex items-end gap-2">
+          <div className="flex-1">
+            <label className={labelCls}>Admin token</label>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="Required when the control plane sets KRONOS_ADMIN_TOKEN"
+              className={inputCls}
+            />
+          </div>
+          <button
+            onClick={saveToken}
+            className="rounded-lg border border-edge bg-abyss px-3 py-2 text-sm text-slate-200 transition-colors hover:border-neon"
+          >
+            {tokenSaved ? 'Saved' : 'Save token'}
+          </button>
+        </div>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <div>

@@ -10,6 +10,9 @@ services:
     environment:
       PORT: "8080"
       REDIS_ADDR: "redis:6379"
+      # Set KRONOS_ADMIN_TOKEN in your shell to enable operator auth;
+      # the mesh nodes present the same value when registering.
+      KRONOS_ADMIN_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
     ports:
       - "8080:8080"
     depends_on:
@@ -30,6 +33,7 @@ services:
       KRONOS_NODE_NAME: "edge-01"
       KRONOS_ROLE: "edge"
       KRONOS_CONTROL_URL: "http://control-plane:8080"
+      KRONOS_CONTROL_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
       KRONOS_LISTEN_PORT: "51820"
     ports:
       - "51820:51820/udp"
@@ -46,6 +50,7 @@ services:
       KRONOS_NODE_NAME: "edge-02"
       KRONOS_ROLE: "node"
       KRONOS_CONTROL_URL: "http://control-plane:8080"
+      KRONOS_CONTROL_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
       KRONOS_LISTEN_PORT: "51820"
     ports:
       - "51821:51820/udp"

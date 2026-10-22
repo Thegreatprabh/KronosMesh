@@ -41,6 +41,11 @@ export default function TopologyCanvas({ topology, selectedVip, onSelect }: Prop
     return map;
   }, [placed]);
 
+  // Link encryption is reported by the control plane from the nodes' own
+  // heartbeat session reports - count and render it truthfully.
+  const encryptedCount = topology.links.filter((l) => l.encrypted).length;
+  const plainCount = topology.links.length - encryptedCount;
+
   return (
     <div className="rounded-xl border border-edge bg-panel p-4">
       <div className="mb-2 flex items-center justify-between">
@@ -48,7 +53,7 @@ export default function TopologyCanvas({ topology, selectedVip, onSelect }: Prop
           <Lock size={15} className="text-neon" /> Mesh Topology
         </h2>
         <span className="font-mono text-xs text-slate-500">
-          {topology.links.length} encrypted tunnels
+          {encryptedCount} encrypted tunnels{plainCount > 0 ? ` / ${plainCount} without session` : ''}
         </span>
       </div>
       <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="w-full">
@@ -65,10 +70,11 @@ export default function TopologyCanvas({ topology, selectedVip, onSelect }: Prop
             <g key={`${link.a}-${link.b}-${i}`}>
               <line
                 x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                stroke={touchesSelection ? '#22d3ee' : '#2dd4bf'}
-                strokeOpacity={touchesSelection ? 0.9 : 0.35}
+                stroke={touchesSelection ? '#22d3ee' : link.encrypted ? '#2dd4bf' : '#475569'}
+                strokeOpacity={touchesSelection ? 0.9 : link.encrypted ? 0.35 : 0.5}
                 strokeWidth={touchesSelection ? 2 : 1.2}
-                className="tunnel-line"
+                strokeDasharray={link.encrypted ? undefined : '4 5'}
+                className={link.encrypted ? 'tunnel-line' : undefined}
               />
               <text
                 x={mx} y={my - 4}
@@ -76,7 +82,7 @@ export default function TopologyCanvas({ topology, selectedVip, onSelect }: Prop
                 className="fill-slate-500 font-mono"
                 fontSize="10"
               >
-                {link.latency_ms.toFixed(1)} ms
+                {link.encrypted ? `${link.latency_ms.toFixed(1)} ms` : 'no session'}
               </text>
             </g>
           );

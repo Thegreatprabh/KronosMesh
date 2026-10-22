@@ -102,6 +102,7 @@ async fn run_up(cfg: Config) -> Result<()> {
     )
     .await
     .context("binding tunnel socket")?;
+    tunnel.set_freshness_dir(&cfg.state_dir);
     tunnel.spawn_loops();
     eprintln!(
         "[kronos] node {} listening on {} (virtual {})",
@@ -145,35 +146,50 @@ async fn run_up(cfg: Config) -> Result<()> {
         ebpf_enabled: ebpf_status.enabled,
         version: VERSION.to_string(),
     };
-    let registration = match client.register(&register_req).await {
+    // Credential for this registration: an operator token from config
+    // wins (provisioning), otherwise the node token saved from our first
+    // registration. The plane rejects re-registrations without one.
+    let register_token = cfg
+        .control_token
+        .clone()
+        .or_else(|| existing.as_ref().and_then(|s| s.node_token.clone()));
+    let registration = match client.register(&register_req, register_token.as_deref()).await {
         Ok(r) => {
             eprintln!(
                 "[kronos] registered with control plane as {} (vip {})",
                 r.node_id, r.assigned_virtual_ip
             );
+            // If the plane issued (or rotated) a token, persist it; else
+            // keep the one we presented.
+            let effective_token = r.node_token.clone().or(register_token.clone());
             NodeState {
                 node_id: r.node_id.clone(),
                 virtual_ip: r.assigned_virtual_ip.clone(),
+                node_token: effective_token.clone(),
             }
             .save(&cfg.state_dir)?;
             tunnel.update_peers(&r.peers);
-            Some(r)
+            Some((r, effective_token))
         }
         Err(e) => {
             eprintln!(
-                "[kronos] control plane unreachable ({e}); running peer-to-peer only"
+                "[kronos] control plane unreachable or registration rejected ({e}); running peer-to-peer only"
             );
             None
         }
     };
 
-    let node_id = registration.as_ref().map(|r| r.node_id.clone());
+    let (node_id, node_token) = match &registration {
+        Some((r, tok)) => (Some(r.node_id.clone()), tok.clone()),
+        None => (None, None),
+    };
     let heartbeat_client = ControlClient::new(&cfg.control_url);
     let hb_tunnel = tunnel.clone();
     let hb_telemetry = telemetry.clone();
     let heartbeat_secs = cfg.heartbeat_secs;
     let heartbeat_handle = tokio::spawn(async move {
         if let Some(node_id) = node_id {
+            let node_token = node_token;
             let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
             loop {
                 interval.tick().await;
@@ -187,8 +203,12 @@ async fn run_up(cfg: Config) -> Result<()> {
                     peers_connected: hb_tunnel.connected_peer_count(),
                     avg_latency_ms: hb_tunnel.avg_latency_ms(),
                     uptime_secs: hb_tunnel.uptime_secs(),
+                    established_peers: hb_tunnel.established_peer_keys(),
                 };
-                match heartbeat_client.heartbeat(&node_id, &payload).await {
+                match heartbeat_client
+                    .heartbeat(&node_id, &payload, node_token.as_deref())
+                    .await
+                {
                     Ok(resp) => hb_tunnel.update_peers(&resp.peers),
                     Err(e) => eprintln!("[kronos] heartbeat failed: {e}"),
                 }

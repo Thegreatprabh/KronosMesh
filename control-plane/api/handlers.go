@@ -2,8 +2,10 @@
 package api
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +18,39 @@ import (
 type Handlers struct {
 	Store store.Store
 	Now   func() time.Time
+	// AdminToken, when non-empty, gates ACL mutations and first-time
+	// node registrations (operator-provisioned mode). Set it from the
+	// KRONOS_ADMIN_TOKEN environment variable. When empty the plane runs
+	// in open development mode (node tokens are still enforced).
+	AdminToken string
+}
+
+// bearerToken extracts the token from an Authorization: Bearer header.
+func bearerToken(c *gin.Context) string {
+	h := c.GetHeader("Authorization")
+	if strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimPrefix(h, "Bearer ")
+	}
+	return ""
+}
+
+// isAdmin reports whether the request carries the admin token.
+func (h *Handlers) isAdmin(c *gin.Context) bool {
+	if h.AdminToken == "" {
+		return false
+	}
+	tok := bearerToken(c)
+	return subtle.ConstantTimeCompare([]byte(tok), []byte(h.AdminToken)) == 1
+}
+
+// requireAdmin gates a handler behind the admin token when one is
+// configured. It returns false (after writing 401) when access is denied.
+func (h *Handlers) requireAdmin(c *gin.Context) bool {
+	if h.AdminToken == "" || h.isAdmin(c) {
+		return true
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "admin token required"})
+	return false
 }
 
 func (h *Handlers) now() time.Time {
@@ -53,8 +88,24 @@ func (h *Handlers) RegisterNode(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body: " + err.Error()})
 		return
 	}
-	node, err := h.Store.RegisterNode(&req, h.now())
+	admin := h.isAdmin(c)
+	if h.AdminToken != "" && !admin && !h.Store.KeyExists(req.PublicKey) {
+		// Operator-provisioned mode: a brand-new public key may only be
+		// registered by the admin. Existing nodes re-register with the
+		// node token they were issued.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "admin token required to register a new node"})
+		return
+	}
+	req.AdminOverride = admin
+	if !admin {
+		req.AuthToken = bearerToken(c)
+	}
+	node, issued, err := h.Store.RegisterNode(&req, h.now())
 	if err != nil {
+		if errors.Is(err, store.ErrUnauthorized) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "invalid node token for this public key"})
+			return
+		}
 		if errors.Is(err, store.ErrIPPoolExhausted) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
@@ -66,6 +117,7 @@ func (h *Handlers) RegisterNode(c *gin.Context) {
 		NodeID:            node.NodeID,
 		AssignedVirtualIP: node.VirtualIP,
 		Peers:             h.Store.ListNodes(),
+		NodeToken:         issued,
 	})
 }
 
@@ -81,7 +133,11 @@ func (h *Handlers) Heartbeat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node_id in body does not match path"})
 		return
 	}
-	if _, err := h.Store.Heartbeat(nodeID, &hb, h.now()); err != nil {
+	if _, err := h.Store.Heartbeat(nodeID, &hb, bearerToken(c), h.now()); err != nil {
+		if errors.Is(err, store.ErrUnauthorized) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -103,6 +159,9 @@ func (h *Handlers) ListAcls(c *gin.Context) {
 
 // CreateAcl handles POST /api/v1/acls.
 func (h *Handlers) CreateAcl(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
 	var rule models.AclRule
 	if err := c.ShouldBindJSON(&rule); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body: " + err.Error()})
@@ -118,6 +177,9 @@ func (h *Handlers) CreateAcl(c *gin.Context) {
 
 // DeleteAcl handles DELETE /api/v1/acls/:id.
 func (h *Handlers) DeleteAcl(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
 	if !h.Store.DeleteAcl(c.Param("id")) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "acl rule not found"})
 		return

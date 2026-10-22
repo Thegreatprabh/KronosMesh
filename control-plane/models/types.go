@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/blake2b"
+	"net"
 )
 
 // Fingerprint returns the BLAKE2b-256 hex digest of a node's X25519
@@ -37,6 +38,10 @@ type PeerNode struct {
 	TxBytes      uint64    `json:"tx_bytes"`
 	RxBytes      uint64    `json:"rx_bytes"`
 	AvgLatencyMs float64   `json:"avg_latency_ms"`
+	// Server-side only: credential hash and heartbeat-reported session
+	// state. Never serialized into API responses.
+	TokenHash        string   `json:"-"`
+	EstablishedPeers []string `json:"-"`
 }
 
 // NodeRegisterRequest is sent by a daemon when it joins the mesh.
@@ -50,7 +55,20 @@ type NodeRegisterRequest struct {
 	NATType     string `json:"nat_type"`
 	EBPFEnabled bool   `json:"ebpf_enabled"`
 	Version     string `json:"version"`
+	// AuthToken carries the node's bearer token from the Authorization
+	// header (handlers fill it; it is never read from the JSON body).
+	AuthToken string `json:"-"`
+	// AdminOverride is set by handlers when a valid admin token was
+	// presented; it authorizes role changes and credential rotation.
+	AdminOverride bool `json:"-"`
 }
+
+// cgnatRange is the shared address space (RFC 6598) the mesh allocates
+// virtual IPs from.
+var cgnatRange = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
 
 // Validate checks structural requirements and that the fingerprint
 // actually belongs to the presented public key (a node cannot claim
@@ -69,6 +87,12 @@ func (r *NodeRegisterRequest) Validate() error {
 	if r.VirtualIP == "" {
 		return fmt.Errorf("virtual_ip is required")
 	}
+	// The requested address must be a real IPv4 address inside the mesh
+	// range; otherwise a node could claim arbitrary addresses (loopback,
+	// public IPs) and poison peer tables and topology.
+	if ip := net.ParseIP(r.VirtualIP); ip == nil || ip.To4() == nil || !cgnatRange.Contains(ip) {
+		return fmt.Errorf("virtual_ip must be an IPv4 address inside 100.64.0.0/10")
+	}
 	if r.Endpoint == "" {
 		return fmt.Errorf("endpoint is required")
 	}
@@ -81,9 +105,13 @@ func (r *NodeRegisterRequest) Validate() error {
 // NodeRegisterResponse tells the daemon its assigned identity and the
 // current peer list.
 type NodeRegisterResponse struct {
-	NodeID            string     `json:"node_id"`
-	AssignedVirtualIP string     `json:"assigned_virtual_ip"`
-	Peers             []PeerNode `json:"peers"`
+	NodeID            string `json:"node_id"`
+	AssignedVirtualIP string `json:"assigned_virtual_ip"`
+	// NodeToken is the node's bearer credential, returned exactly once:
+	// at first registration (or when an admin rotates it). The daemon
+	// stores it and presents it on heartbeats and re-registrations.
+	NodeToken string     `json:"node_token,omitempty"`
+	Peers     []PeerNode `json:"peers"`
 }
 
 // HeartbeatPayload is the daemon's periodic telemetry report.
@@ -96,6 +124,10 @@ type HeartbeatPayload struct {
 	PeersConnected uint32  `json:"peers_connected"`
 	AvgLatencyMs   float64 `json:"avg_latency_ms"`
 	UptimeSecs     uint64  `json:"uptime_secs"`
+	// EstablishedPeers lists the public keys this node currently holds
+	// established encrypted sessions with; the topology builder uses it
+	// to mark links encrypted truthfully instead of assuming.
+	EstablishedPeers []string `json:"established_peers"`
 }
 
 // HeartbeatResponse acknowledges the heartbeat and returns the fresh

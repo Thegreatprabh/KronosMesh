@@ -27,11 +27,19 @@ impl ControlClient {
         }
     }
 
-    pub async fn register(&self, req: &NodeRegisterRequest) -> Result<NodeRegisterResponse> {
-        let resp = self
+    pub async fn register(
+        &self,
+        req: &NodeRegisterRequest,
+        token: Option<&str>,
+    ) -> Result<NodeRegisterResponse> {
+        let mut rb = self
             .http
             .post(format!("{}/api/v1/nodes/register", self.base_url))
-            .json(req)
+            .json(req);
+        if let Some(t) = token {
+            rb = rb.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = rb
             .send()
             .await
             .context("register request failed")?
@@ -44,14 +52,19 @@ impl ControlClient {
         &self,
         node_id: &str,
         payload: &HeartbeatPayload,
+        token: Option<&str>,
     ) -> Result<HeartbeatResponse> {
-        let resp = self
+        let mut rb = self
             .http
             .post(format!(
                 "{}/api/v1/nodes/{node_id}/heartbeat",
                 self.base_url
             ))
-            .json(payload)
+            .json(payload);
+        if let Some(t) = token {
+            rb = rb.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = rb
             .send()
             .await
             .context("heartbeat request failed")?

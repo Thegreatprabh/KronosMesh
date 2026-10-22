@@ -8,6 +8,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,8 +27,9 @@ import (
 
 // Store is the state contract the API layer depends on.
 type Store interface {
-	RegisterNode(req *models.NodeRegisterRequest, now time.Time) (*models.PeerNode, error)
-	Heartbeat(nodeID string, hb *models.HeartbeatPayload, now time.Time) (*models.PeerNode, error)
+	RegisterNode(req *models.NodeRegisterRequest, now time.Time) (*models.PeerNode, string, error)
+	Heartbeat(nodeID string, hb *models.HeartbeatPayload, token string, now time.Time) (*models.PeerNode, error)
+	KeyExists(publicKey string) bool
 	ListNodes() []models.PeerNode
 	Topology(now time.Time) models.MeshTopology
 	ListAcls() models.AclPolicyResponse
@@ -59,6 +63,29 @@ const (
 
 // ErrIPPoolExhausted is returned when every address in the pool is taken.
 var ErrIPPoolExhausted = errors.New("virtual IP pool exhausted")
+
+// ErrUnauthorized is returned when a node credential check fails:
+// heartbeats and re-registrations must present the bearer token that was
+// issued at first registration (or use an admin override).
+var ErrUnauthorized = errors.New("unauthorized: invalid or missing node token")
+
+// ErrUnknownNode is returned for operations addressed to a missing node.
+var ErrUnknownNode = errors.New("unknown node")
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func newNodeToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure is catastrophic; fall back to concatenated
+		// UUIDs rather than issuing an empty credential.
+		return uuid.NewString() + uuid.NewString()
+	}
+	return hex.EncodeToString(b)
+}
 
 func formatPoolIP(offset uint32) string {
 	v := ipPoolNetBase + offset
@@ -116,35 +143,57 @@ func (s *MemoryStore) allocateIP(requested string) (string, error) {
 // RegisterNode inserts a new node or refreshes an existing one (nodes
 // are keyed by public key, so re-registration after a restart keeps
 // the same node_id). Caller must not hold the lock.
-func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Time) (*models.PeerNode, error) {
+// RegisterNode registers a node or refreshes an existing registration.
+// The second return value is a newly issued node token: non-empty only at
+// first registration, or when an admin override rotates the credential.
+// Re-registration with an existing public key requires the node's token
+// (or an admin override); this stops anyone from hijacking a node's
+// endpoint or role by replaying its public key.
+func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Time) (*models.PeerNode, string, error) {
 	if err := req.Validate(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if id, ok := s.byKey[req.PublicKey]; ok {
 		node := s.byID[id]
+		if !req.AdminOverride && (node.TokenHash == "" || hashToken(req.AuthToken) != node.TokenHash) {
+			return nil, "", ErrUnauthorized
+		}
 		node.NodeName = req.NodeName
 		node.Endpoint = req.Endpoint
-		node.Role = req.Role
+		if req.AdminOverride {
+			// Role changes are operator decisions; a node re-registering
+			// with its own token cannot promote itself.
+			node.Role = req.Role
+		}
 		node.NATType = req.NATType
 		node.EBPFEnabled = req.EBPFEnabled
 		node.Online = true
 		node.LastSeen = now
+		issued := ""
+		if req.AdminOverride {
+			// Admin re-registration rotates the credential (recovery path
+			// for a node that lost its token).
+			issued = newNodeToken()
+			node.TokenHash = hashToken(issued)
+		}
 		s.mirrorNode(node)
 		copy := *node
-		return &copy, nil
+		return &copy, issued, nil
 	}
 	virtualIP, err := s.allocateIP(req.VirtualIP)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	issued := newNodeToken()
 	node := &models.PeerNode{
 		NodeID:      uuid.NewString(),
 		NodeName:    req.NodeName,
 		PublicKey:   req.PublicKey,
 		Fingerprint: req.Fingerprint,
 		VirtualIP:   virtualIP,
+		TokenHash:   hashToken(issued),
 		Endpoint:    req.Endpoint,
 		Role:        req.Role,
 		Online:      true,
@@ -156,19 +205,31 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 	s.byKey[node.PublicKey] = node.NodeID
 	s.mirrorNode(node)
 	copy := *node
-	return &copy, nil
+	return &copy, issued, nil
 }
 
-func (s *MemoryStore) Heartbeat(nodeID string, hb *models.HeartbeatPayload, now time.Time) (*models.PeerNode, error) {
+// KeyExists reports whether a public key is already registered.
+func (s *MemoryStore) KeyExists(publicKey string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.byKey[publicKey]
+	return ok
+}
+
+func (s *MemoryStore) Heartbeat(nodeID string, hb *models.HeartbeatPayload, token string, now time.Time) (*models.PeerNode, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	node, ok := s.byID[nodeID]
 	if !ok {
-		return nil, fmt.Errorf("unknown node_id %s", nodeID)
+		return nil, fmt.Errorf("%w: %s", ErrUnknownNode, nodeID)
+	}
+	if node.TokenHash == "" || hashToken(token) != node.TokenHash {
+		return nil, ErrUnauthorized
 	}
 	node.TxBytes = hb.TxBytes
 	node.RxBytes = hb.RxBytes
 	node.AvgLatencyMs = hb.AvgLatencyMs
+	node.EstablishedPeers = append([]string(nil), hb.EstablishedPeers...)
 	node.Online = true
 	node.LastSeen = now
 	s.mirrorNode(node)
@@ -189,7 +250,8 @@ func (s *MemoryStore) ListNodes() []models.PeerNode {
 
 // Topology builds the full render model. Links connect every pair of
 // online nodes (the mesh is logically fully connected); a link's
-// latency is the mean of both endpoints' reported averages.
+// latency is the mean of both endpoints' reported averages, and its
+// encrypted flag reflects heartbeat-reported established sessions.
 func (s *MemoryStore) Topology(now time.Time) models.MeshTopology {
 	nodes := s.ListNodes()
 	links := make([]models.TopologyLink, 0)
@@ -203,7 +265,11 @@ func (s *MemoryStore) Topology(now time.Time) models.MeshTopology {
 				A:         a.VirtualIP,
 				B:         b.VirtualIP,
 				LatencyMs: (a.AvgLatencyMs + b.AvgLatencyMs) / 2,
-				Encrypted: true,
+				// Truthful encryption state: a link is encrypted only
+				// when at least one endpoint's latest heartbeat reports
+				// an established session with the other. (Previously this
+				// was hard-coded true for every pair.)
+				Encrypted: reportsEstablished(a, b.PublicKey) || reportsEstablished(b, a.PublicKey),
 			})
 		}
 	}
@@ -214,6 +280,15 @@ func (s *MemoryStore) Topology(now time.Time) models.MeshTopology {
 		nodes = make([]models.PeerNode, 0)
 	}
 	return models.MeshTopology{Nodes: nodes, Links: links, GeneratedAt: now}
+}
+
+func reportsEstablished(n models.PeerNode, peerKey string) bool {
+	for _, k := range n.EstablishedPeers {
+		if k == peerKey {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *MemoryStore) ListAcls() models.AclPolicyResponse {

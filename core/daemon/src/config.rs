@@ -27,6 +27,11 @@ pub struct Config {
     pub ebpf_object: Option<String>,
     pub stun_server: Option<String>,
     pub advertise_endpoint: Option<String>,
+    /// Operator/admin token for the control plane (KRONOS_CONTROL_TOKEN).
+    /// Used to provision this node when the plane runs with
+    /// KRONOS_ADMIN_TOKEN set; the per-node token issued at registration
+    /// takes over for heartbeats afterwards.
+    pub control_token: Option<String>,
 }
 
 impl Default for Config {
@@ -44,6 +49,7 @@ impl Default for Config {
             ebpf_object: None,
             stun_server: None,
             advertise_endpoint: None,
+            control_token: None,
         }
     }
 }
@@ -69,6 +75,7 @@ struct FileConfig {
     ebpf_object: Option<String>,
     stun_server: Option<String>,
     advertise_endpoint: Option<String>,
+    control_token: Option<String>,
 }
 
 impl Config {
@@ -97,6 +104,9 @@ impl Config {
                 if file.advertise_endpoint.is_some() {
                     cfg.advertise_endpoint = file.advertise_endpoint;
                 }
+                if file.control_token.is_some() {
+                    cfg.control_token = file.control_token;
+                }
             }
         }
         if let Ok(v) = std::env::var("KRONOS_NODE_NAME") { cfg.node_name = v; }
@@ -110,6 +120,9 @@ impl Config {
         if let Ok(v) = std::env::var("KRONOS_STUN_SERVER") { cfg.stun_server = Some(v); }
         if let Ok(v) = std::env::var("KRONOS_ADVERTISE_ENDPOINT") {
             cfg.advertise_endpoint = Some(v);
+        }
+        if let Ok(v) = std::env::var("KRONOS_CONTROL_TOKEN") {
+            cfg.control_token = Some(v);
         }
         Ok(cfg)
     }
@@ -183,6 +196,10 @@ impl Identity {
 pub struct NodeState {
     pub node_id: String,
     pub virtual_ip: String,
+    /// Bearer credential issued by the control plane. Persisted in the
+    /// state dir (file mode 0600) so restarts keep their identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_token: Option<String>,
 }
 
 impl NodeState {
@@ -193,10 +210,14 @@ impl NodeState {
 
     pub fn save(&self, state_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(state_dir)?;
-        std::fs::write(
-            state_dir.join("node_state.json"),
-            serde_json::to_string_pretty(self)?,
-        )?;
+        let path = state_dir.join("node_state.json");
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        // The state file now carries a credential; keep it owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 }

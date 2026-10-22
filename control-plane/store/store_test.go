@@ -48,15 +48,17 @@ func TestRegisterAssignsAndDeduplicates(t *testing.T) {
 	keyA, bytesA := keyFor("alpha")
 	reqA := testRequest("alpha", keyA)
 	reqA.Fingerprint = models.Fingerprint(bytesA)
-	nodeA, err := s.RegisterNode(reqA, now)
+	nodeA, issuedA, err := s.RegisterNode(reqA, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if nodeA.VirtualIP != "100.64.0.10" {
 		t.Fatalf("requested free IP not honored: %s", nodeA.VirtualIP)
 	}
-	// Same public key re-registering keeps the node ID (restart case).
-	again, err := s.RegisterNode(reqA, now)
+	// Same public key re-registering keeps the node ID (restart case);
+	// it must present the token issued at first registration.
+	reqA.AuthToken = issuedA
+	again, _, err := s.RegisterNode(reqA, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +69,7 @@ func TestRegisterAssignsAndDeduplicates(t *testing.T) {
 	keyB, bytesB := keyFor("beta-node")
 	reqB := testRequest("beta", keyB)
 	reqB.Fingerprint = models.Fingerprint(bytesB)
-	nodeB, err := s.RegisterNode(reqB, now)
+	nodeB, _, err := s.RegisterNode(reqB, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,12 +87,12 @@ func TestHeartbeatAndReaper(t *testing.T) {
 	key, keyBytes := keyFor("gamma")
 	req := testRequest("gamma", key)
 	req.Fingerprint = models.Fingerprint(keyBytes)
-	node, err := s.RegisterNode(req, now)
+	node, token, err := s.RegisterNode(req, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hb := &models.HeartbeatPayload{NodeID: node.NodeID, TxBytes: 100, RxBytes: 200, AvgLatencyMs: 5}
-	updated, err := s.Heartbeat(node.NodeID, hb, now.Add(5*time.Second))
+	updated, err := s.Heartbeat(node.NodeID, hb, token, now.Add(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +156,8 @@ func TestAllocatorExhaustionReturnsError(t *testing.T) {
 		req := testRequest(name, key)
 		req.Fingerprint = models.Fingerprint(keyBytes)
 		req.VirtualIP = "100.64.0.10" // same request for every node
-		return s.RegisterNode(req, now)
+		node, _, err := s.RegisterNode(req, now)
+		return node, err
 	}
 
 	first, err := register("n1")
@@ -180,5 +183,73 @@ func TestAllocatorExhaustionReturnsError(t *testing.T) {
 	}
 	if _, err := register("n4444"); !errors.Is(err, ErrIPPoolExhausted) {
 		t.Fatalf("fourth register should fail with ErrIPPoolExhausted, got %v", err)
+	}
+}
+
+// TestStoreRejectsSpoofedReRegisterAndHeartbeat proves the credential
+// checks: a stranger who knows a victim's public key (public information)
+// cannot take over its registration or forge its heartbeats.
+func TestStoreRejectsSpoofedReRegisterAndHeartbeat(t *testing.T) {
+	s := NewMemoryStore("")
+	now := time.Now().UTC()
+	key, keyBytes := keyFor("victim-node")
+	req := testRequest("victim", key)
+	req.Fingerprint = models.Fingerprint(keyBytes)
+	node, token, err := s.RegisterNode(req, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("first registration must issue a node token")
+	}
+	// Re-register with no token: rejected.
+	attacker := testRequest("victim", key)
+	attacker.Fingerprint = models.Fingerprint(keyBytes)
+	attacker.Endpoint = "203.0.113.99:51820"
+	if _, _, err := s.RegisterNode(attacker, now); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("spoofed re-register: got %v, want ErrUnauthorized", err)
+	}
+	// The stored endpoint must be untouched.
+	if got := s.ListNodes()[0].Endpoint; got == "203.0.113.99:51820" {
+		t.Fatal("spoofed re-register changed the endpoint")
+	}
+	// Heartbeat with a wrong token: rejected; with the real one: accepted.
+	hb := &models.HeartbeatPayload{NodeID: node.NodeID}
+	if _, err := s.Heartbeat(node.NodeID, hb, "forged-token", now); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("forged heartbeat: got %v, want ErrUnauthorized", err)
+	}
+	if _, err := s.Heartbeat(node.NodeID, hb, token, now); err != nil {
+		t.Fatalf("legit heartbeat rejected: %v", err)
+	}
+	// A node-token re-register cannot change its own role.
+	req.AuthToken = token
+	req.Role = "admin"
+	again, _, err := s.RegisterNode(req, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Role == "admin" {
+		t.Fatal("node promoted its own role via re-registration")
+	}
+	// Heartbeat-reported sessions drive topology encryption truthfully.
+	hb.EstablishedPeers = []string{key}
+	if _, err := s.Heartbeat(node.NodeID, hb, token, now); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListNodes()[0].EstablishedPeers; len(got) != 1 || got[0] != key {
+		t.Fatalf("established peers not stored: %v", got)
+	}
+}
+
+// TestRegisterRejectsOutOfRangeVirtualIP pins the requested-address
+// validation: virtual IPs must live inside the mesh range.
+func TestRegisterRejectsOutOfRangeVirtualIP(t *testing.T) {
+	s := NewMemoryStore("")
+	key, keyBytes := keyFor("out-of-range-node")
+	req := testRequest("rogue", key)
+	req.Fingerprint = models.Fingerprint(keyBytes)
+	req.VirtualIP = "8.8.8.8"
+	if _, _, err := s.RegisterNode(req, time.Now().UTC()); err == nil {
+		t.Fatal("out-of-range virtual_ip must be rejected")
 	}
 }
