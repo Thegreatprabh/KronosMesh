@@ -173,6 +173,16 @@ export default function App() {
                 <AlertTriangle size={13} /> DEMO DATA
               </span>
             )}
+            {data?.stale && (
+              <span className="flex items-center gap-1.5 rounded bg-amber/10 px-2 py-1 text-xs font-semibold text-amber">
+                <AlertTriangle size={13} /> STALE
+              </span>
+            )}
+            {data && !data.demo && !data.stale && (
+              <span className="flex items-center gap-1.5 rounded bg-neon/10 px-2 py-1 text-xs font-semibold text-neon">
+                <span className="h-1.5 w-1.5 rounded-full bg-neon" /> LIVE
+              </span>
+            )}
             <span className="hidden font-mono text-xs text-slate-500 md:block">
               {controlUrl()}
             </span>
@@ -191,11 +201,40 @@ export default function App() {
           <div className="flex items-start gap-2 rounded-xl border border-amber/30 bg-amber/5 p-3 text-sm text-amber">
             <AlertTriangle size={16} className="mt-0.5 shrink-0" />
             <span>
-              Control plane unreachable at {controlUrl()} — showing the
-              built-in demo dataset. Start it with{' '}
+              Live data unavailable
+              {data.error && (
+                <>
+                  {' '}
+                  — {data.error.kind} error: {data.error.message}
+                </>
+              )}{' '}
+              — showing the built-in demo dataset; nothing on this page is
+              real telemetry. Start the plane with{' '}
               <code className="font-mono">docker compose up</code> or{' '}
               <code className="font-mono">go run ./control-plane</code> for
               live data.
+            </span>
+          </div>
+        )}
+
+        {data?.stale && (
+          <div className="flex items-start gap-2 rounded-xl border border-amber/30 bg-amber/5 p-3 text-sm text-amber">
+            <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+            <span>
+              Refresh failed
+              {data.error && (
+                <>
+                  {' '}
+                  ({data.error.kind}
+                  {data.error.status ? ` ${data.error.status}` : ''}:{' '}
+                  {data.error.message})
+                </>
+              )}{' '}
+              — showing the last live data
+              {data.fetchedAt && (
+                <> from {new Date(data.fetchedAt).toLocaleTimeString()}</>
+              )}
+              . Retrying automatically.
             </span>
           </div>
         )}

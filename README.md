@@ -2,10 +2,10 @@
 
 ![KronosMesh mesh animation](assets/mesh-banner.svg)
 
-**Zero-Trust Mesh VPN (userspace overlay) and Cryptographic Overlay Network.**
+**Zero-Trust Mesh VPN and Cryptographic Overlay Network.**
 An open-source alternative to Tailscale and Cloudflare Tunnels  -  connect servers and computers anywhere in the world into one secure, encrypted, private network, with **no paid third-party cloud dependency**. You run the control plane; your traffic never touches anyone else's infrastructure.
 
-**Current status:** working userspace overlay prototype. Nodes authenticate, encrypt and relay traffic between daemons today, but decrypted packets are delivered to an application sink inside the daemon, **not** to the host network stack - there is no TUN device, OS routing or DNS integration yet, so this is not (yet) a drop-in system VPN. See *Honest status*.
+**Current status:** working mesh VPN with Linux host integration. Nodes authenticate, encrypt and relay traffic peer-to-peer; with TUN enabled (`KRONOS_TUN=1`, Linux) the daemon owns a real network interface — host traffic for mesh addresses flows through the tunnel, routes are installed and removed automatically, and a built-in mesh DNS answers `<node>.mesh` names. A service gateway carries TCP services (e.g. postgres, ssh) between nodes with ACL policy enforced on both ends. Without TUN, the daemon still runs as a userspace overlay delivering payloads to an application sink. Cryptographic processing is userspace on every platform (an eBPF/XDP capability probe runs at startup; a kernel fast path is roadmap). See *Honest status*.
 
 [![CI](https://github.com/Thegreatprabh/KronosMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/Thegreatprabh/KronosMesh/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)
@@ -28,7 +28,7 @@ Legacy VPNs fail in predictable ways:
 KronosMesh is built the other way:
 
 - **Peer-to-peer data plane**  -  nodes talk directly (with mesh relaying when direct paths fail); the control plane only coordinates identity and policy, never carries your packets.
-- **Zero trust by construction**  -  every node has an X25519 identity verified by BLAKE2b fingerprint at registration; every packet is sealed with ChaCha20-Poly1305 after a Noise_IK handshake; ACL policy is role-based (`source role -> destination service : port`) and enforced inside the data plane: any matching DENY rule drops traffic in both directions regardless of rule priority, and traffic with no matching ALLOW is denied by default (deny-override + default-deny - see How it works).
+- **Zero trust by construction**  -  every node has an X25519 identity verified by BLAKE2b fingerprint at registration; every packet is sealed with ChaCha20-Poly1305 after a Noise_IK handshake; ACL policy is role-based (`source role -> destination service : port`) and enforced where the traffic flows: wildcard rules are decided inside the tunnel's data plane, service-specific rules at the service gateway on both the sending and the receiving node. Any matching DENY rule drops traffic regardless of rule priority, and traffic with no matching ALLOW is denied by default (deny-override + default-deny - see How it works).
 - **Self-hosted everything**  -  the control plane is a single Go binary with an in-memory store (optional Redis mirror with restart recovery). No accounts, no SaaS, no phone-home.
 - **Fast where it counts**  -  a Rust data plane (Noise_IK + ChaCha20-Poly1305 in userspace today; an eBPF/XDP capability probe runs at startup and a kernel fast path is on the roadmap), with relaying built in.
 
@@ -51,8 +51,12 @@ flowchart TB
     subgraph DP["Data Plane  -  per node (Rust + Tokio)"]
         UDP["UDP listener<br/>WireGuard-style frames"]
         NOISE["Noise_IK handshake<br/>X25519 - ChaCha20-Poly1305 - BLAKE2s"]
+        GW["Service gateway<br/>TCP forwards - ACL both ends"]
+        TUN["TUN interface (Linux)<br/>host routes - mesh DNS"]
         XDP["eBPF/XDP probe (Linux)<br/>userspace data plane"]
         UDP --> NOISE
+        NOISE --> GW
+        NOISE --> TUN
         UDP --> XDP
     end
 
@@ -111,6 +115,16 @@ node_name = "edge-blr-01"
 role = "edge"
 control_url = "http://127.0.0.1:8080"
 listen_port = 51820
+tun = true            # Linux host integration (or KRONOS_TUN=1)
+
+# Service gateway: local clients connect to 127.0.0.1:15432 and are
+# carried over the mesh to the db node's gateway, which dials its own
+# 127.0.0.1:5432 - after policy checks on BOTH ends.
+[[services]]
+name = "postgres"
+listen = "127.0.0.1:15432"
+target_vip = "100.64.0.12"
+target_port = 5432
 ```
 
 | Env var | Meaning |
@@ -127,6 +141,10 @@ listen_port = 51820
 | `KRONOS_CONTROL_TOKEN` | *(daemon)* Token presented at registration - the admin token when provisioning, afterwards the issued node token is persisted automatically |
 | `KRONOS_CORS_ORIGINS` | *(control plane)* Comma-separated browser origins allowed to call the API (default: local dashboard origins) |
 | `KRONOS_TLS_CERT` / `KRONOS_TLS_KEY` | *(control plane)* PEM paths; when both are set the control plane serves HTTPS |
+| `KRONOS_REQUIRE_TLS` | *(control plane)* `1` makes TLS mandatory: startup fails without a certificate pair, so production cannot silently serve bearer tokens over plaintext |
+| `KRONOS_ALLOW_INSECURE_HTTP` | *(daemon)* `1` permits sending node tokens to a non-loopback `http://` control plane (trusted networks only, e.g. an isolated Docker bridge); by default the daemon refuses - use `https://` or loopback |
+| `KRONOS_TUN` | *(daemon)* `1` enables the Linux TUN host integration (needs root or CAP_NET_ADMIN): the node's VIP is assigned to the interface named by the `interface` config (`kronos0`), the mesh range is routed into it, and routes/device are removed at shutdown |
+| `KRONOS_DNS` / `KRONOS_DNS_UPSTREAM` | *(daemon)* Mesh DNS on the node's VIP:53 while TUN is on (default on; set `KRONOS_DNS=0` to disable); non-mesh names are forwarded to the upstream (default `1.1.1.1:53`) |
 
 ## How it works
 
@@ -136,11 +154,17 @@ listen_port = 51820
 
 **Transport.** WireGuard-style frames (`type | indices | counter | AEAD ciphertext`) over UDP, a 2048-packet sliding replay window, keepalives, and roaming (endpoints are re-learned from authenticated traffic). If a destination is not a direct peer, intermediate nodes relay the sealed packet  -  the relay never sees plaintext, the original source travels inside the encrypted header (policy is evaluated against the sender, never the relay), and a TTL bounds forwarding so loops die. Nodes also proactively establish sessions with every known peer, so a running mesh is actually connected, not just registered. The receive path is flood-hardened: frame size/type checks, the per-source INIT rate limit and a bounded cap on concurrent frame handlers all run *before* a datagram is copied or a task is spawned, so overload drops packets (counted in telemetry) instead of exhausting memory or the scheduler.
 
-**Data plane modes.** On Linux the daemon probes for XDP capability at startup (kernel support, privileges, optional eBPF object validation via the real `bpf()` syscall) and reports exactly what it found and why; a minimal XDP program load is attempted as the probe. Packet processing itself runs in the userspace data plane in this release - on every platform, with identical semantics - and a kernel fast path is on the roadmap. `kronos-daemon up` prints the probe verdict at startup, and nodes report the probe outcome (`ebpf_probe_passed`) and the fast-path state as separate fields end to end, so no API or dashboard consumer can mistake a passed probe for kernel packet processing.
+**Data plane modes.** On Linux the daemon probes for XDP capability at startup (kernel support, privileges, optional eBPF object validation via the real `bpf()` syscall) and reports exactly what it found and why; a minimal XDP program load is attempted as the probe. The `bpf()` syscall number is selected per CPU architecture at compile time (x86_64, x86, aarch64, riscv64, arm are defined; anything else reports itself unsupported instead of invoking a wrong syscall), and CI runs the daemon test suite on both x86_64 and ARM64. Packet processing itself runs in the userspace data plane in this release - on every platform, with identical semantics - and a kernel fast path is on the roadmap. `kronos-daemon up` prints the probe verdict at startup, and nodes report the probe outcome (`ebpf_probe_passed`) and the fast-path state as separate fields end to end, so no API or dashboard consumer can mistake a passed probe for kernel packet processing.
 
-**Zero-trust enforcement.** ACL policy is not just stored centrally  -  daemons sync it continuously and the Rust data plane enforces it in the tunnel itself: rules with destination `*` or `mesh-data` and port `0` (wildcard) govern mesh traffic. The model is **deny-override with default-deny**: every matching rule is considered (priority only decides which DENY gets reported, never the outcome); any matching DENY drops the packet on both send and receive paths even when a better-priority ALLOW also matches; and traffic with **no matching ALLOW is denied by default** - a fresh mesh passes no application data until the operator publishes an ALLOW rule. Drops are counted in telemetry and logged. Port `0` means "any port" throughout the system.
+**Zero-trust enforcement.** ACL policy is not just stored centrally  -  daemons sync it continuously and enforce it where traffic flows, through one shared decision function (`acl_decision`) so the semantics can never drift between enforcement points. Rules with destination `*` or `mesh-data` and port `0` (wildcard) are decided in the tunnel itself for raw mesh data. Service-specific rules (a named service on a concrete port, e.g. `edge -> postgres:5432`) are decided by the **service gateway** on both ends of a stream: the initiating node checks its own role before sending anything, and the target node checks the sender's role again before dialing the local service. The model is **deny-override with default-deny**: every matching rule is considered (priority only decides which DENY gets reported, never the outcome); any matching DENY drops the traffic even when a better-priority ALLOW also matches; and traffic with **no matching ALLOW is denied by default** - a fresh mesh passes no application data until the operator publishes an ALLOW rule. Drops are counted in telemetry and logged. Port `0` means "any port" throughout the system. The dashboard labels every rule with the point that enforces it (DATA PLANE or SERVICE GATEWAY).
 
-**Control plane.** Gin REST API: node registration with CGNAT-range (`100.64.0.0/10`) virtual-IP assignment (requested addresses are validated to be inside the range), heartbeat telemetry, mesh topology whose link encryption flags come from the nodes' own heartbeat session reports - never assumed - and versioned ACL policy that daemons sync continuously. Nodes that stop heartbeating are reaped to `offline` after 45 s. The store is in-memory and authoritative; with `REDIS_ADDR` set, every write is mirrored to Redis as full state and the registry + policy are rebuilt from that mirror at startup (recovered nodes return offline until they heartbeat), so a control-plane restart no longer loses the mesh. Startup is fail-closed on operator auth (see `KRONOS_ADMIN_TOKEN`). The HTTP server runs with explicit timeouts and a 64 KB request-body cap, and serves HTTPS when `KRONOS_TLS_CERT`/`KRONOS_TLS_KEY` are set.
+**Service gateway.** Configured forwards (`[[services]]`) listen on loopback TCP ports and carry each connection as an encrypted stream (OPEN/DATA/CLOSE frames inside the same Noise sessions, relayed like data when the target is not a direct peer). The receiving gateway dials `127.0.0.1:<port>` only after its policy check passes; a denied or unreachable target is answered with a stream close, so the local client sees a refused connection rather than a hang. V1 limits: no stream flow control beyond bounded queues (the gateway targets low-rate service traffic, not bulk transfer) and no idle timeout.
+
+**Host integration (Linux).** With `KRONOS_TUN=1` the daemon creates a TUN device, assigns the node's virtual IP, brings the interface up with the tunnel MTU, and routes the whole mesh range (`100.64.0.0/10`) into it; on shutdown the route and device are removed again. Packets the kernel routes in are forwarded to their destination VIP through the tunnel; decrypted IP packets addressed to this node are written back to the device for normal host delivery - `ping`, `ssh` and every other IP tool work against mesh addresses with no application changes. A mesh DNS resolver listens on the node's VIP (port 53): `<node>.mesh` and bare node names are answered from the live peer table, unknown mesh names get NXDOMAIN (never leaked upstream), and all other queries are forwarded to a configurable upstream resolver. `scripts/tun-netns-e2e.sh` exercises the whole path (two namespaces, control plane, ping + DNS across the mesh) on a real Linux host.
+
+**Endpoint discovery.** Public-endpoint discovery uses STUN binding requests with a fresh random transaction ID per request; a response is accepted only if it arrives from the exact server endpoint queried and passes strict validation (message type, magic cookie, transaction ID, declared length accounting for the whole datagram, attribute bounds) - forged or stray datagrams cannot steer the endpoint a node advertises.
+
+**Control plane.** Gin REST API: node registration with CGNAT-range (`100.64.0.0/10`) virtual-IP assignment (requested addresses are validated to be inside the range), heartbeat telemetry, mesh topology whose link encryption flags come from the nodes' own heartbeat session reports - never assumed - and versioned ACL policy that daemons sync continuously. Nodes that stop heartbeating are reaped to `offline` after 45 s. The store is in-memory and authoritative; with `REDIS_ADDR` set, every write is mirrored to Redis as full state and the registry + policy are rebuilt from that mirror at startup (recovered nodes return offline until they heartbeat), so a control-plane restart no longer loses the mesh. Startup is fail-closed on operator auth (see `KRONOS_ADMIN_TOKEN`) and can be made fail-closed on transport too: with `KRONOS_REQUIRE_TLS=1` the plane refuses to start without a certificate pair, and in plaintext mode it logs a loud warning that bearer tokens cross the wire unencrypted. Daemons enforce the other half: a node refuses to send its tokens to a non-loopback `http://` control plane unless the operator explicitly opts in for a trusted network (`KRONOS_ALLOW_INSECURE_HTTP=1`). The HTTP server runs with explicit timeouts and a 64 KB request-body cap, and serves HTTPS when `KRONOS_TLS_CERT`/`KRONOS_TLS_KEY` are set.
 
 **Shared contracts.** One JSON contract (`contracts/` at the repo root) pins the payloads shared by the daemon, the control plane, and the dashboard. Both the Rust and Go test suites assert their types against those fixtures, so the three codebases cannot silently drift.
 
@@ -153,6 +177,7 @@ kronos-mesh/
 |-- control-plane/      Go control plane: registry, topology, ACL policy (Gin)
 |-- apps/dashboard/     React console: topology map, ACL matrix, crypto inspector
 |-- contracts/          Cross-language JSON contract fixtures
+|-- scripts/            tun-netns-e2e.sh - two-namespace host-networking E2E (real Linux)
 |-- docker-compose.yml  redis + control plane + dashboard + 2 mesh nodes
 `-- Makefile            build-all - dev - test - docker-up - clean
 ```
@@ -161,17 +186,18 @@ kronos-mesh/
 
 Every layer is tested, and the suites run in CI:
 
-- **Rust**  -  Noise_IK handshake round-trips, HMAC/HKDF-BLAKE2s vectors cross-checked against reference implementations, fingerprint vectors shared with Go, replay/tamper rejection, 2-node exchange and 3-node relay over an in-memory transport, STUN parsing, eBPF object validation, ACL deny-override/default-deny semantics, assigned-VIP resolution, INIT rate-limit window/pruning, and the frame-handler flood cap.
-- **Go**  -  registration/IP allocation, heartbeat + reaper, ACL versioning, full HTTP flows, fail-closed admin startup, Redis restart recovery (nodes, policy, credential hashes), and contract-fixture shape equality with the Rust types.
-- **Dashboard**  -  strict TypeScript (`tsc --noEmit`) + production Vite build.
+- **Rust**  -  Noise_IK handshake round-trips, HMAC/HKDF-BLAKE2s vectors cross-checked against reference implementations, fingerprint vectors shared with Go, replay/tamper rejection, 2-node exchange and 3-node relay over an in-memory transport, STUN response validation (forged/wrong-transaction/cookie/length responses rejected), eBPF object validation, per-architecture `bpf()` syscall selection, ACL deny-override/default-deny semantics for both the data gate and service questions, service-gateway streams end-to-end over the in-memory transport (including target-side and initiator-side denials), a real TUN device ICMP roundtrip against the host kernel (skips where `/dev/net/tun` is unavailable), mesh DNS parsing/routing/response building, the control-URL token-transport policy, assigned-VIP resolution, INIT rate-limit window/pruning, and the frame-handler flood cap. The suite also runs on ARM64 in CI.
+- **Go**  -  registration/IP allocation, heartbeat + reaper, ACL versioning, full HTTP flows, fail-closed admin startup, fail-closed TLS-required startup, Redis restart recovery (nodes, policy, credential hashes), and contract-fixture shape equality with the Rust types.
+- **Dashboard**  -  strict TypeScript (`tsc --noEmit`) + production Vite build. Connection state is explicit: LIVE, STALE (last live data kept, with the classified failure - network/HTTP/parse), or DEMO (only before the first successful live load, always labelled).
 
 ## Honest status
 
 - The framing and handshake are KronosMesh's own implementation of the Noise_IK pattern with WireGuard-style packet layout; it is **not** wire-compatible with the WireGuard® protocol itself.
 - eBPF today is a capability probe + object validation, not a packet fast path: all traffic runs through the userspace data plane, and the telemetry fast-path counter stays at zero until a real XDP program ships (roadmap).
 - INIT freshness floors persist across restarts and INITs older than two minutes are rejected outright; the residual replay exposure after a responder restart is bounded to that two-minute window and cannot be exploited to read traffic (session keys still require the peer's static secret).
-- Control-plane state survives restarts only when Redis is configured (write-through mirror + startup recovery); the in-memory store remains authoritative, and without Redis a restart starts empty and nodes simply re-register. Still roadmap: Ed25519-signed policy bundles and a TUN device consumer for host-level routing.
-- The control-plane API is plain HTTP unless you configure the TLS options - run it on a trusted network or serve it over HTTPS.
+- Control-plane state survives restarts only when Redis is configured (write-through mirror + startup recovery); the in-memory store remains authoritative, and without Redis a restart starts empty and nodes simply re-register. Still roadmap: Ed25519-signed policy bundles.
+- TUN host integration is Linux-only today (macOS/Windows utun/Wintun support is roadmap), and the mesh DNS answers A records for mesh names plus transparent forwarding - it synthesizes no AAAA records and does no DNSSEC. The service gateway is v1: bounded queues instead of flow control, and no idle timeouts.
+- The control-plane API is plain HTTP unless you configure the TLS options - for any non-local deployment set `KRONOS_REQUIRE_TLS=1` with certificates (or terminate TLS at a trusted reverse proxy and keep the plane's port reachable only from it); daemons already refuse to send tokens to remote plaintext endpoints by default.
 
 ## License
 

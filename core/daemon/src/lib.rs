@@ -1,6 +1,9 @@
 pub mod config;
+pub mod dns;
+pub mod gateway;
 pub mod control_client;
 pub mod crypto;
 pub mod ebpf_loader;
+pub mod tun;
 pub mod tunnel;
 pub mod wire;

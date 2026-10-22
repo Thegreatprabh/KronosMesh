@@ -141,7 +141,43 @@ pub fn validate_ebpf_object(bytes: &[u8]) -> Result<(), String> {
 mod linux_bpf {
     use std::ffi::CString;
 
-    pub const SYS_BPF: i64 = 321; // x86_64
+    /// The bpf() syscall number is architecture-specific. The value
+    /// used to be hardcoded to the x86_64 number (321); on another
+    /// architecture that number is a DIFFERENT syscall, so the probe
+    /// would not just fail - it would invoke the wrong kernel entry
+    /// point. Numbers below are from the Linux syscall tables
+    /// (asm-generic for aarch64/riscv64, per-arch tables otherwise).
+    /// An architecture with no entry is unsupported: the probe
+    /// reports that plainly instead of guessing.
+    #[cfg(target_arch = "x86_64")]
+    pub const SYS_BPF: i64 = 321;
+    #[cfg(target_arch = "x86")]
+    pub const SYS_BPF: i64 = 357;
+    #[cfg(target_arch = "aarch64")]
+    pub const SYS_BPF: i64 = 280;
+    #[cfg(target_arch = "riscv64")]
+    pub const SYS_BPF: i64 = 280;
+    #[cfg(target_arch = "arm")]
+    pub const SYS_BPF: i64 = 386;
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "arm"
+    )))]
+    pub const SYS_BPF: i64 = -1;
+
+    /// True when this build knows the bpf() syscall number for the
+    /// architecture it was compiled for.
+    pub fn bpf_supported() -> bool {
+        SYS_BPF >= 0
+    }
+
+    /// Errno reported when the architecture is unsupported: ENOSYS
+    /// (38, "function not implemented") - the honest kernel answer.
+    pub const ERR_UNSUPPORTED_ARCH: i32 = 38;
+
     pub const BPF_PROG_LOAD: u32 = 5;
     pub const BPF_PROG_TYPE_XDP: u32 = 6;
 
@@ -184,6 +220,9 @@ mod linux_bpf {
     /// returns the program fd (caller closes it); on failure returns the
     /// errno so the caller can explain the fallback.
     pub fn try_load_xdp_probe() -> Result<i32, i32> {
+        if !bpf_supported() {
+            return Err(ERR_UNSUPPORTED_ARCH);
+        }
         let license = CString::new("MIT").unwrap();
         let mut name = [0u8; 16];
         name[..9].copy_from_slice(b"kronoswd\0");
@@ -266,6 +305,24 @@ impl EbpfLoader {
                     }
                 }
             }
+            if !linux_bpf::bpf_supported() {
+                let reason = format!(
+                    "eBPF probe unsupported on this CPU architecture ({}): \
+                     no bpf() syscall number is defined for it; running \
+                     the userspace data plane",
+                    std::env::consts::ARCH
+                );
+                ring.push(reason.clone());
+                return EbpfStatus {
+                    mode: DataPlaneMode::UserspaceFallback,
+                    enabled: false,
+                    probe_passed: false,
+                    reason,
+                    kernel,
+                    object_path: object_path.map(|s| s.to_string()),
+                    object_validated,
+                };
+            }
             match linux_bpf::try_load_xdp_probe() {
                 Ok(fd) => {
                     linux_bpf::close_fd(fd);
@@ -346,6 +403,32 @@ mod tests {
         wrong_machine[18] = 62; // EM_X86_64
         assert!(validate_ebpf_object(&wrong_machine).is_err());
         assert!(validate_ebpf_object(&[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bpf_syscall_number_matches_the_compiled_architecture() {
+        // The number MUST be the bpf() syscall for the architecture
+        // this binary was compiled for - the pre-fix code hardcoded
+        // x86_64's 321 for every target.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(super::linux_bpf::SYS_BPF, 321);
+        #[cfg(target_arch = "x86")]
+        assert_eq!(super::linux_bpf::SYS_BPF, 357);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(super::linux_bpf::SYS_BPF, 280);
+        #[cfg(target_arch = "riscv64")]
+        assert_eq!(super::linux_bpf::SYS_BPF, 280);
+        #[cfg(target_arch = "arm")]
+        assert_eq!(super::linux_bpf::SYS_BPF, 386);
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "arm"
+        ))]
+        assert!(super::linux_bpf::bpf_supported());
     }
 
     #[test]

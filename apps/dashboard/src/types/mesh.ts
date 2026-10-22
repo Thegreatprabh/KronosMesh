@@ -46,8 +46,28 @@ export interface AclPolicyResponse {
   rules: AclRule[];
 }
 
+/// How a dashboard load failed. The console treats these differently:
+/// a network failure usually means the plane is down or unreachable,
+/// an HTTP failure means it answered but rejected the request, and a
+/// parse failure means it answered with something unintelligible.
+export type LoadErrorKind = 'network' | 'http' | 'parse';
+
+export interface LoadError {
+  kind: LoadErrorKind;
+  message: string;
+  status?: number;
+}
+
 export interface DashboardData {
   topology: MeshTopology;
   policy: AclPolicyResponse;
   demo: boolean;
+  /// True when this payload is the last successfully loaded live data,
+  /// kept on screen because the latest refresh failed. Demo data is
+  /// only ever shown when no live load has succeeded yet.
+  stale?: boolean;
+  /// Why the latest refresh failed (present in stale and demo states).
+  error?: LoadError;
+  /// Epoch milliseconds of the last successful live load.
+  fetchedAt?: number;
 }

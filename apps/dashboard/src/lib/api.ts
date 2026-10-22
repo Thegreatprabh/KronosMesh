@@ -2,6 +2,8 @@ import type {
   AclPolicyResponse,
   AclRule,
   DashboardData,
+  LoadError,
+  LoadErrorKind,
   MeshTopology,
   PeerNode,
 } from '../types/mesh';
@@ -14,12 +16,49 @@ export function controlUrl(): string {
   return CONTROL_URL;
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const resp = await fetch(`${CONTROL_URL}${path}`);
-  if (!resp.ok) {
-    throw new Error(`${path} returned ${resp.status}`);
+/// A control-plane load failure, classified so the console can explain
+/// WHAT went wrong instead of silently swapping in demo values.
+export class ApiError extends Error {
+  readonly kind: LoadErrorKind;
+  readonly status?: number;
+
+  constructor(kind: LoadErrorKind, message: string, status?: number) {
+    super(message);
+    this.kind = kind;
+    this.status = status;
   }
-  return (await resp.json()) as T;
+}
+
+function toLoadError(e: unknown): LoadError {
+  if (e instanceof ApiError) {
+    return { kind: e.kind, message: e.message, status: e.status };
+  }
+  return {
+    kind: 'network',
+    message: e instanceof Error ? e.message : 'unknown error',
+  };
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  let resp: Response;
+  try {
+    resp = await fetch(`${CONTROL_URL}${path}`);
+  } catch (e) {
+    throw new ApiError(
+      'network',
+      `cannot reach the control plane at ${CONTROL_URL} (${
+        e instanceof Error ? e.message : 'network error'
+      })`,
+    );
+  }
+  if (!resp.ok) {
+    throw new ApiError('http', `${path} returned HTTP ${resp.status}`, resp.status);
+  }
+  try {
+    return (await resp.json()) as T;
+  } catch {
+    throw new ApiError('parse', `${path} returned a body that is not valid JSON`);
+  }
 }
 
 export async function fetchTopology(): Promise<MeshTopology> {
@@ -178,17 +217,30 @@ function demoData(): DashboardData {
   };
 }
 
-/// Loads topology + policy from the control plane; falls back to the
-/// labelled demo dataset when it cannot be reached.
+/// The last payload that genuinely came from the control plane. A
+/// failed refresh must never replace real data with demo values: the
+/// operator keeps looking at the last truth, marked stale, with the
+/// failure explained. Demo data appears only before the first
+/// successful live load.
+let lastGood: DashboardData | null = null;
+
+/// Loads topology + policy from the control plane. On failure, returns
+/// the last good live payload marked stale (with the classified error)
+/// when one exists, and the labelled demo dataset only otherwise.
 export async function loadDashboardData(): Promise<DashboardData> {
   try {
     const [topology, policy] = await Promise.all([
       fetchTopology(),
       fetchAcls(),
     ]);
-    return { topology, policy, demo: false };
-  } catch {
-    return demoData();
+    lastGood = { topology, policy, demo: false, fetchedAt: Date.now() };
+    return lastGood;
+  } catch (e) {
+    const error = toLoadError(e);
+    if (lastGood) {
+      return { ...lastGood, stale: true, error };
+    }
+    return { ...demoData(), error };
   }
 }
 

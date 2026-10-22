@@ -17,6 +17,13 @@
 //	KRONOS_TLS_CERT / KRONOS_TLS_KEY
 //	           optional PEM paths; when both are set the plane serves
 //	           HTTPS instead of HTTP (point daemons at an https:// URL).
+//	KRONOS_REQUIRE_TLS
+//	           when "1", a certificate pair is mandatory: the plane
+//	           refuses to start without one, so a production deploy
+//	           cannot silently serve bearer tokens over plaintext
+//	           because two variables were forgotten. (Terminating TLS
+//	           at a trusted reverse proxy is the supported alternative;
+//	           keep this port reachable only from that proxy.)
 //	KRONOS_CORS_ORIGINS
 //	           comma-separated browser origins allowed to call the API
 //	           (default: localhost dashboard origins).
@@ -122,7 +129,10 @@ func main() {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	certFile, keyFile := os.Getenv("KRONOS_TLS_CERT"), os.Getenv("KRONOS_TLS_KEY")
+	certFile, keyFile, err := resolveTLSMode(os.Getenv)
+	if err != nil {
+		log.Fatalf("kronos control plane: %v", err)
+	}
 	if certFile != "" && keyFile != "" {
 		log.Printf("kronos control plane listening on :%s (TLS)", port)
 		if err := srv.ListenAndServeTLS(certFile, keyFile); err != nil {
@@ -130,6 +140,7 @@ func main() {
 		}
 		return
 	}
+	log.Printf("WARNING: serving plaintext HTTP on :%s - node and operator bearer tokens cross the wire unencrypted. Keep this port on a trusted network only, or set KRONOS_TLS_CERT/KRONOS_TLS_KEY (KRONOS_REQUIRE_TLS=1 makes TLS mandatory)", port)
 	log.Printf("kronos control plane listening on :%s", port)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
@@ -160,6 +171,21 @@ func resolveAdminMode(getenv func(string) string) (token string, devOpen bool, e
 		return "", false, fmt.Errorf("KRONOS_ADMIN_TOKEN is too short (%d characters): use at least %d, or set KRONOS_DEV_OPEN_ADMIN=1 for local development only", len(token), minAdminTokenLen)
 	}
 	return token, devOpen, nil
+}
+
+// resolveTLSMode decides the transport posture. KRONOS_REQUIRE_TLS=1
+// makes TLS mandatory — the plane refuses to start without a
+// certificate pair — so production cannot silently fall back to
+// plaintext bearer tokens. A half-configured pair is always an error.
+func resolveTLSMode(getenv func(string) string) (certFile, keyFile string, err error) {
+	certFile, keyFile = getenv("KRONOS_TLS_CERT"), getenv("KRONOS_TLS_KEY")
+	if (certFile == "") != (keyFile == "") {
+		return "", "", fmt.Errorf("KRONOS_TLS_CERT and KRONOS_TLS_KEY must be set together (only one was provided)")
+	}
+	if getenv("KRONOS_REQUIRE_TLS") == "1" && certFile == "" {
+		return "", "", fmt.Errorf("KRONOS_REQUIRE_TLS=1 but KRONOS_TLS_CERT/KRONOS_TLS_KEY are not set: refusing to serve operator endpoints and bearer tokens over plaintext HTTP. Provide a certificate pair, or terminate TLS at a trusted reverse proxy and keep this port reachable only from that proxy")
+	}
+	return certFile, keyFile, nil
 }
 
 // bodyLimitMiddleware caps request bodies (registrations, heartbeats and

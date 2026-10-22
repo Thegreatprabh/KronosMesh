@@ -13,6 +13,19 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::crypto::{fingerprint, hex_decode, hex_encode};
 
+/// One configured service forward for the gateway: connections to
+/// `listen` (a loopback address on this host) are carried over the
+/// mesh to the target node's gateway, which dials 127.0.0.1 on
+/// `target_port` after its own policy check. Configured via
+/// [[services]] tables in the TOML config.
+#[derive(Debug, Clone)]
+pub struct ServiceForward {
+    pub name: String,
+    pub listen: String,
+    pub target_vip: String,
+    pub target_port: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub node_name: String,
@@ -27,6 +40,26 @@ pub struct Config {
     pub ebpf_object: Option<String>,
     pub stun_server: Option<String>,
     pub advertise_endpoint: Option<String>,
+    /// Permit sending bearer tokens to an http:// control plane whose
+    /// host is NOT loopback (KRONOS_ALLOW_INSECURE_HTTP=1). Off by
+    /// default: node tokens must not cross an untrusted network in
+    /// plaintext. The explicit opt-in exists for trusted networks,
+    /// e.g. an isolated Docker bridge between node and plane.
+    pub allow_insecure_http: bool,
+    /// Host TUN integration (KRONOS_TUN=1): create a real network
+    /// interface (named by `interface`, MTU by `mtu`) that carries
+    /// host traffic for the mesh range. Linux only; needs root or
+    /// CAP_NET_ADMIN. Off by default - the application sink remains
+    /// the fallback data path.
+    pub tun: bool,
+    /// Mesh DNS (KRONOS_DNS, default on when TUN is on): answer DNS
+    /// on this node's VIP for `<node>.mesh` names from the live peer
+    /// table and forward everything else to `dns_upstream`.
+    pub dns: bool,
+    /// Upstream resolver for non-mesh DNS names (KRONOS_DNS_UPSTREAM).
+    pub dns_upstream: String,
+    /// Service forwards served by this node's gateway ([[services]]).
+    pub services: Vec<ServiceForward>,
     /// Operator/admin token for the control plane (KRONOS_CONTROL_TOKEN).
     /// Used to provision this node when the plane runs with
     /// KRONOS_ADMIN_TOKEN set; the per-node token issued at registration
@@ -49,6 +82,11 @@ impl Default for Config {
             ebpf_object: None,
             stun_server: None,
             advertise_endpoint: None,
+            allow_insecure_http: false,
+            tun: false,
+            dns: true,
+            dns_upstream: "1.1.1.1:53".to_string(),
+            services: Vec::new(),
             control_token: None,
         }
     }
@@ -59,6 +97,14 @@ fn default_node_name() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "kronos-node".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct FileService {
+    name: String,
+    listen: String,
+    target_vip: String,
+    target_port: u16,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -75,6 +121,11 @@ struct FileConfig {
     ebpf_object: Option<String>,
     stun_server: Option<String>,
     advertise_endpoint: Option<String>,
+    allow_insecure_http: Option<bool>,
+    tun: Option<bool>,
+    dns: Option<bool>,
+    dns_upstream: Option<String>,
+    services: Option<Vec<FileService>>,
     control_token: Option<String>,
 }
 
@@ -104,6 +155,21 @@ impl Config {
                 if file.advertise_endpoint.is_some() {
                     cfg.advertise_endpoint = file.advertise_endpoint;
                 }
+                if let Some(v) = file.allow_insecure_http { cfg.allow_insecure_http = v; }
+                if let Some(v) = file.tun { cfg.tun = v; }
+                if let Some(v) = file.dns { cfg.dns = v; }
+                if file.dns_upstream.is_some() { cfg.dns_upstream = file.dns_upstream.clone().unwrap(); }
+                if let Some(list) = file.services {
+                    cfg.services = list
+                        .into_iter()
+                        .map(|f| ServiceForward {
+                            name: f.name,
+                            listen: f.listen,
+                            target_vip: f.target_vip,
+                            target_port: f.target_port,
+                        })
+                        .collect();
+                }
                 if file.control_token.is_some() {
                     cfg.control_token = file.control_token;
                 }
@@ -121,10 +187,54 @@ impl Config {
         if let Ok(v) = std::env::var("KRONOS_ADVERTISE_ENDPOINT") {
             cfg.advertise_endpoint = Some(v);
         }
+        if let Ok(v) = std::env::var("KRONOS_TUN") {
+            cfg.tun = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        if let Ok(v) = std::env::var("KRONOS_DNS") {
+            cfg.dns = !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        if let Ok(v) = std::env::var("KRONOS_DNS_UPSTREAM") { cfg.dns_upstream = v; }
+        if let Ok(v) = std::env::var("KRONOS_ALLOW_INSECURE_HTTP") {
+            cfg.allow_insecure_http = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         if let Ok(v) = std::env::var("KRONOS_CONTROL_TOKEN") {
             cfg.control_token = Some(v);
         }
         Ok(cfg)
+    }
+}
+
+/// Decides whether bearer tokens may be sent to the control plane at
+/// `url`. https is always fine; http is fine for loopback endpoints
+/// (same-host deployments and local development). Any other http
+/// endpoint would put node/operator tokens on the wire in plaintext,
+/// so it needs the explicit KRONOS_ALLOW_INSECURE_HTTP opt-in.
+pub fn control_url_allows_tokens(url: &str, allow_insecure_http: bool) -> bool {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => {
+            if allow_insecure_http {
+                return true;
+            }
+            // host_str serializes IPv6 hosts with brackets: "[::1]".
+            let host = parsed
+                .host_str()
+                .unwrap_or("")
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            if host.eq_ignore_ascii_case("localhost") {
+                return true;
+            }
+            match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => ip.is_loopback(),
+                Err(_) => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -237,6 +347,26 @@ pub fn proposed_virtual_ip(public_key: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_url_token_transport_policy() {
+        // https is fine anywhere.
+        assert!(control_url_allows_tokens("https://cp.example.com:8080", false));
+        // http is fine on loopback only.
+        assert!(control_url_allows_tokens("http://127.0.0.1:8080", false));
+        assert!(control_url_allows_tokens("http://localhost:8080", false));
+        assert!(control_url_allows_tokens("http://[::1]:8080", false));
+        // Remote plaintext http would leak bearer tokens: refused.
+        assert!(!control_url_allows_tokens("http://192.168.1.20:8080", false));
+        assert!(!control_url_allows_tokens("http://control-plane:8080", false));
+        assert!(!control_url_allows_tokens("http://cp.example.com", false));
+        // The explicit trusted-network opt-in re-allows it.
+        assert!(control_url_allows_tokens("http://control-plane:8080", true));
+        assert!(control_url_allows_tokens("http://192.168.1.20:8080", true));
+        // Unparseable or exotic schemes never carry tokens.
+        assert!(!control_url_allows_tokens("not a url", true));
+        assert!(!control_url_allows_tokens("ftp://127.0.0.1", true));
+    }
 
     #[test]
     fn identity_persists_across_loads() {

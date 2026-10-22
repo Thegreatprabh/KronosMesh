@@ -37,6 +37,13 @@ pub const MSG_DATA: u8 = 4;
 pub const KIND_PING: u8 = 0x01;
 pub const KIND_PONG: u8 = 0x02;
 pub const KIND_DATA: u8 = 0x03;
+/// Service-stream frames (see gateway.rs): a stream carries one TCP
+/// service connection between two nodes' gateways. Policy for streams
+/// is decided by the gateways using `acl_decision`; the tunnel only
+/// transports authenticated stream frames and relays them like data.
+pub const KIND_STREAM_OPEN: u8 = 0x04;
+pub const KIND_STREAM_DATA: u8 = 0x05;
+pub const KIND_STREAM_CLOSE: u8 = 0x06;
 
 const HANDSHAKE_WAIT: Duration = Duration::from_millis(3000);
 /// Hop limit stamped on inner packets; relays decrement it and drop at
@@ -230,6 +237,84 @@ pub enum AclDeny {
     DefaultDeny,
 }
 
+/// The verdict of the single ACL decision every enforcement point
+/// shares: the tunnel's data gate (service "mesh-data", port 0) and
+/// the service gateway (a named service on a concrete port).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AclDecision {
+    Allow,
+    /// A matching DENY rule decides (deny-override at any priority).
+    DenyRule(AclRule),
+    /// No ALLOW rule matched: the default posture is deny.
+    DefaultDeny,
+}
+
+/// Evaluates `rules` for one (source role, service, port) question.
+///
+/// A rule matches when its role is "*" or the source role, its
+/// service is "*" or the queried service, and its port is 0 (any) or
+/// the queried port. DENY overrides ALLOW regardless of priority;
+/// with no matching ALLOW the default is deny. Since the Round-3
+/// review this is the only place these semantics live: before, the
+/// data path evaluated a wildcard-only subset and service-specific
+/// rules were decided nowhere.
+pub fn acl_decision(
+    rules: &[AclRule],
+    source_role: &str,
+    service: &str,
+    port: u16,
+) -> AclDecision {
+    let mut best_deny: Option<&AclRule> = None;
+    let mut allowed = false;
+    for rule in rules {
+        let matches = (rule.source_role == "*" || rule.source_role == source_role)
+            && (rule.dest_service == "*" || rule.dest_service == service)
+            && (rule.port == 0 || rule.port == port);
+        if !matches {
+            continue;
+        }
+        if rule.action == "DENY" {
+            if best_deny.is_none_or(|b| rule.priority < b.priority) {
+                best_deny = Some(rule);
+            }
+        } else if rule.action == "ALLOW" {
+            allowed = true;
+        }
+    }
+    if let Some(rule) = best_deny {
+        return AclDecision::DenyRule(rule.clone());
+    }
+    if allowed {
+        AclDecision::Allow
+    } else {
+        AclDecision::DefaultDeny
+    }
+}
+
+/// A service-stream event delivered to the gateway. The sender's vip
+/// and role are resolved from the authenticated session and the peer
+/// table exactly like the data path — a relaying peer cannot launder
+/// the origin's identity.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Open {
+        src_vip: String,
+        src_role: String,
+        stream_id: u32,
+        service: String,
+        port: u16,
+    },
+    Data {
+        src_vip: String,
+        stream_id: u32,
+        data: Vec<u8>,
+    },
+    Close {
+        src_vip: String,
+        stream_id: u32,
+    },
+}
+
 pub struct Tunnel<T: Transport> {
     transport: Arc<T>,
     identity: Arc<Identity>,
@@ -252,6 +337,8 @@ pub struct Tunnel<T: Transport> {
     /// the receive loop before a handler task is spawned.
     frame_permits: Arc<tokio::sync::Semaphore>,
     app_tx: mpsc::Sender<(String, Vec<u8>)>,
+    stream_tx: mpsc::Sender<StreamEvent>,
+    stream_rx: Mutex<Option<mpsc::Receiver<StreamEvent>>>,
     started: Instant,
 }
 
@@ -305,6 +392,7 @@ impl<T: Transport> Tunnel<T> {
         let octets = vip_to_octets(local_vip)
             .ok_or_else(|| anyhow!("invalid virtual ip {local_vip}"))?;
         let (app_tx, app_rx) = mpsc::channel(1024);
+        let (stream_tx, stream_rx) = mpsc::channel(256);
         let tunnel = Arc::new(Self {
             transport: Arc::new(transport),
             identity: Arc::new(identity),
@@ -323,6 +411,8 @@ impl<T: Transport> Tunnel<T> {
             init_rate: Mutex::new(HashMap::new()),
             frame_permits: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_FRAMES)),
             app_tx,
+            stream_tx,
+            stream_rx: Mutex::new(Some(stream_rx)),
             started: Instant::now(),
         });
         Ok((tunnel, app_rx))
@@ -554,33 +644,10 @@ impl<T: Transport> Tunnel<T> {
     /// no matching DENY overrides it.
     fn acl_denied_for(&self, source_role: &str) -> Option<AclDeny> {
         let rules = self.acl_rules.lock().unwrap();
-        let mut best_deny: Option<&AclRule> = None;
-        let mut allowed = false;
-        for rule in rules.iter() {
-            let role_matches = rule.source_role == source_role || rule.source_role == "*";
-            let service_matches =
-                rule.dest_service == "*" || rule.dest_service == "mesh-data";
-            let port_matches = rule.port == 0;
-            if !(role_matches && service_matches && port_matches) {
-                continue;
-            }
-            if rule.action == "DENY" {
-                // Deny-override: remember the best-priority DENY; an
-                // ALLOW at any priority must never cancel it.
-                if best_deny.is_none_or(|b| rule.priority < b.priority) {
-                    best_deny = Some(rule);
-                }
-            } else if rule.action == "ALLOW" {
-                allowed = true;
-            }
-        }
-        if let Some(rule) = best_deny {
-            return Some(AclDeny::Rule(rule.clone()));
-        }
-        if allowed {
-            None
-        } else {
-            Some(AclDeny::DefaultDeny)
+        match acl_decision(&rules, source_role, "mesh-data", 0) {
+            AclDecision::Allow => None,
+            AclDecision::DenyRule(rule) => Some(AclDeny::Rule(rule)),
+            AclDecision::DefaultDeny => Some(AclDeny::DefaultDeny),
         }
     }
 
@@ -801,6 +868,111 @@ impl<T: Transport> Tunnel<T> {
         let octets = vip_to_octets(dst_vip)
             .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
         self.send_inner(octets, KIND_DATA, payload).await
+    }
+
+    /// A snapshot of the currently enforced ACL rules. The service
+    /// gateway evaluates service questions against the same list.
+    pub fn acl_snapshot(&self) -> Vec<AclRule> {
+        self.acl_rules.lock().unwrap().clone()
+    }
+
+    /// Takes the service-stream event receiver (once). The gateway
+    /// consumes it; without a consumer, stream events land in a
+    /// bounded channel and are dropped rather than buffered forever.
+    pub fn take_stream_receiver(&self) -> Option<mpsc::Receiver<StreamEvent>> {
+        self.stream_rx.lock().unwrap().take()
+    }
+
+    /// Opens a service stream at a peer's gateway. Policy is the
+    /// caller's job on this side (the initiating gateway checks) and
+    /// the receiver's job on its side (its gateway checks again); the
+    /// tunnel only transports.
+    pub async fn send_stream_open(
+        &self,
+        dst_vip: &str,
+        stream_id: u32,
+        service: &str,
+        port: u16,
+    ) -> Result<()> {
+        let octets = vip_to_octets(dst_vip)
+            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        let mut body = Vec::with_capacity(6 + service.len());
+        body.extend_from_slice(&stream_id.to_be_bytes());
+        body.extend_from_slice(&port.to_be_bytes());
+        body.extend_from_slice(service.as_bytes());
+        self.send_inner(octets, KIND_STREAM_OPEN, &body).await
+    }
+
+    pub async fn send_stream_data(
+        &self,
+        dst_vip: &str,
+        stream_id: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        let octets = vip_to_octets(dst_vip)
+            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        let mut body = Vec::with_capacity(4 + data.len());
+        body.extend_from_slice(&stream_id.to_be_bytes());
+        body.extend_from_slice(data);
+        self.send_inner(octets, KIND_STREAM_DATA, &body).await
+    }
+
+    pub async fn send_stream_close(&self, dst_vip: &str, stream_id: u32) -> Result<()> {
+        let octets = vip_to_octets(dst_vip)
+            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        self.send_inner(octets, KIND_STREAM_CLOSE, &stream_id.to_be_bytes())
+            .await
+    }
+
+    /// Parses a decrypted stream frame for this node and queues it
+    /// for the gateway. Malformed frames are dropped silently.
+    fn deliver_stream_event(&self, kind: u8, src_vip: &[u8; 4], src_role: String, body: &[u8]) {
+        let src = octets_to_vip(src_vip);
+        let event = match kind {
+            KIND_STREAM_OPEN => {
+                if body.len() < 6 {
+                    return;
+                }
+                let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                let port = u16::from_be_bytes(body[4..6].try_into().unwrap());
+                let service = String::from_utf8_lossy(&body[6..]).into_owned();
+                if service.is_empty() {
+                    return;
+                }
+                StreamEvent::Open {
+                    src_vip: src,
+                    src_role,
+                    stream_id,
+                    service,
+                    port,
+                }
+            }
+            KIND_STREAM_DATA => {
+                if body.len() < 4 {
+                    return;
+                }
+                let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                StreamEvent::Data {
+                    src_vip: src,
+                    stream_id,
+                    data: body[4..].to_vec(),
+                }
+            }
+            KIND_STREAM_CLOSE => {
+                if body.len() < 4 {
+                    return;
+                }
+                let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                StreamEvent::Close {
+                    src_vip: src,
+                    stream_id,
+                }
+            }
+            _ => return,
+        };
+        if self.stream_tx.try_send(event).is_err() {
+            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // -- receiving ---------------------------------------------------------------
@@ -1252,6 +1424,31 @@ impl<T: Transport> Tunnel<T> {
                     }
                 }
             }
+            KIND_STREAM_OPEN | KIND_STREAM_DATA | KIND_STREAM_CLOSE => {
+                if dst_vip == self.local_vip {
+                    // Same origin resolution as the data path: the
+                    // ORIGINAL sender's role, never the relay's.
+                    let src_role = self
+                        .peer_by_vip(&src_vip)
+                        .map(|p| p.role.lock().unwrap().clone())
+                        .unwrap_or_else(|| peer.role.lock().unwrap().clone());
+                    self.deliver_stream_event(kind, &src_vip, src_role, &body);
+                } else if ttl > 1 {
+                    // Relay toward the destination like data traffic;
+                    // policy is enforced by the destination's gateway.
+                    if let Some(next_hop) = self.peer_by_vip(&dst_vip) {
+                        if next_hop.public_hex != peer.public_hex {
+                            let _ = self
+                                .send_inner_full(dst_vip, kind, &body, src_vip, ttl - 1)
+                                .await;
+                        }
+                    } else {
+                        self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             _ => {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
             }
@@ -1316,6 +1513,52 @@ mod tests {
             priority: 1,
         }]);
         (tunnel, rx, identity, telemetry)
+    }
+
+    fn svc_rule(id: &str, role: &str, service: &str, port: u16, action: &str, priority: i32) -> AclRule {
+        AclRule {
+            id: id.to_string(),
+            source_role: role.to_string(),
+            dest_service: service.to_string(),
+            port,
+            action: action.to_string(),
+            priority,
+        }
+    }
+
+    #[test]
+    fn acl_decision_matches_service_and_port() {
+        let rules = vec![svc_rule("r1", "edge", "postgres", 5432, "ALLOW", 10)];
+        assert_eq!(acl_decision(&rules, "edge", "postgres", 5432), AclDecision::Allow);
+        // Wrong port, wrong service, wrong role: no match, default deny.
+        assert_eq!(acl_decision(&rules, "edge", "postgres", 5433), AclDecision::DefaultDeny);
+        assert_eq!(acl_decision(&rules, "edge", "ssh", 5432), AclDecision::DefaultDeny);
+        assert_eq!(acl_decision(&rules, "iot", "postgres", 5432), AclDecision::DefaultDeny);
+        // A specific service rule never leaks into the mesh-data gate.
+        assert_eq!(acl_decision(&rules, "edge", "mesh-data", 0), AclDecision::DefaultDeny);
+    }
+
+    #[test]
+    fn acl_decision_wildcards_and_deny_override() {
+        // Wildcard service with a concrete port.
+        let rules = vec![svc_rule("r1", "*", "*", 443, "ALLOW", 10)];
+        assert_eq!(acl_decision(&rules, "anyone", "https", 443), AclDecision::Allow);
+        assert_eq!(acl_decision(&rules, "anyone", "https", 80), AclDecision::DefaultDeny);
+        // Port 0 in a rule matches any port of that service.
+        let rules = vec![svc_rule("r1", "edge", "postgres", 0, "ALLOW", 10)];
+        assert_eq!(acl_decision(&rules, "edge", "postgres", 6543), AclDecision::Allow);
+        // DENY overrides ALLOW even at a much worse priority number.
+        let rules = vec![
+            svc_rule("allow", "edge", "postgres", 5432, "ALLOW", 1),
+            svc_rule("deny", "edge", "postgres", 5432, "DENY", 100),
+        ];
+        match acl_decision(&rules, "edge", "postgres", 5432) {
+            AclDecision::DenyRule(r) => assert_eq!(r.id, "deny"),
+            other => panic!("expected DenyRule, got {other:?}"),
+        }
+        // The mesh-data question still resolves through the same fn.
+        let rules = vec![svc_rule("r1", "*", "*", 0, "ALLOW", 1)];
+        assert_eq!(acl_decision(&rules, "whoever", "mesh-data", 0), AclDecision::Allow);
     }
 
     #[tokio::test]

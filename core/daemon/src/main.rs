@@ -6,14 +6,20 @@
 //!   kronos-daemon bench    — measure handshake time + sealed-packet
 //!                            throughput between two in-process nodes
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kronos_daemon::config::{proposed_virtual_ip, Config, Identity, NodeState};
+use kronos_daemon::config::{
+    control_url_allows_tokens, proposed_virtual_ip, Config, Identity, NodeState,
+};
 use kronos_daemon::control_client::{discover_endpoint, ControlClient};
+use kronos_daemon::dns;
+use kronos_daemon::gateway::Gateway;
+use kronos_daemon::tun::{self, TunDevice};
+use std::net::Ipv4Addr;
 use kronos_daemon::ebpf_loader::{EbpfLoader, EventRing, TelemetryCounters};
 use kronos_daemon::tunnel::{MemoryHub, Tunnel};
 use kronos_daemon::wire::{AclRule, HeartbeatPayload, NodeRegisterRequest};
@@ -75,6 +81,20 @@ fn tracing_subscriber_init() {
 }
 
 async fn run_up(cfg: Config) -> Result<()> {
+    // Bearer tokens (the operator token at registration, the per-node
+    // token on every heartbeat) must never cross an untrusted network
+    // in plaintext: refuse a remote http:// control plane unless the
+    // operator explicitly opted in for a trusted network.
+    if !control_url_allows_tokens(&cfg.control_url, cfg.allow_insecure_http) {
+        bail!(
+            "refusing to send node tokens to {} over plaintext HTTP: \
+             use an https:// control URL or a loopback address, or set \
+             KRONOS_ALLOW_INSECURE_HTTP=1 if the network between this \
+             node and the plane is trusted (e.g. an isolated Docker \
+             network)",
+            cfg.control_url
+        );
+    }
     let identity = Identity::load_or_create(&cfg.state_dir)?;
     let telemetry = Arc::new(TelemetryCounters::default());
     let ring = Arc::new(EventRing::new(256));
@@ -186,6 +206,16 @@ async fn run_up(cfg: Config) -> Result<()> {
     if let Some((r, _)) = &registration {
         tunnel.update_peers(&r.peers);
     }
+    // Mesh DNS name table, kept current from the same peer lists that
+    // drive the tunnel (registration now, every heartbeat later).
+    let local_vip_addr: Ipv4Addr = bind_vip
+        .parse()
+        .context("assigned virtual IP is not an IPv4 address")?;
+    let name_table = dns::new_name_table();
+    match &registration {
+        Some((r, _)) => dns::update_names(&name_table, &r.peers, &cfg.node_name, local_vip_addr),
+        None => dns::update_names(&name_table, &[], &cfg.node_name, local_vip_addr),
+    }
     tunnel.spawn_loops();
     eprintln!(
         "[kronos] node {} listening on {} (virtual {})",
@@ -194,11 +224,61 @@ async fn run_up(cfg: Config) -> Result<()> {
         bind_vip
     );
 
-    // Application sink: decrypted payloads addressed to this node are
-    // logged (a TUN consumer would take them from here in fast-path
-    // deployments).
+    // Host integration (KRONOS_TUN=1): a real TUN interface carries
+    // host traffic for the mesh range. Setup failure is fatal - the
+    // operator explicitly asked for host networking, and silently
+    // falling back to the application sink would misreport the
+    // node's posture.
+    let mut tun_teardown_name: Option<String> = None;
+    let mut tun_writer = None;
+    if cfg.tun {
+        let device = TunDevice::create(&cfg.interface).context("TUN setup")?;
+        let dev_name = device.name().to_string();
+        tun::configure(&dev_name, local_vip_addr, cfg.mtu)
+            .context("TUN address/route setup")?;
+        let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<(Ipv4Addr, Vec<u8>)>(256);
+        tun_writer = Some(device.writer_handle());
+        tun::spawn_pump(device, local_vip_addr, pkt_tx);
+        let pump_tunnel = tunnel.clone();
+        tokio::spawn(async move {
+            while let Some((dst, packet)) = pkt_rx.recv().await {
+                // Send errors (unknown peer, ACL denial, no session)
+                // are counted inside the tunnel; the pump never stalls.
+                let _ = pump_tunnel.send_data(&dst.to_string(), &packet).await;
+            }
+        });
+        if cfg.dns {
+            let dns_table = name_table.clone();
+            let dns_upstream = cfg.dns_upstream.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dns::serve(local_vip_addr, dns_table, dns_upstream).await {
+                    eprintln!("[kronos] mesh DNS unavailable: {e}");
+                }
+            });
+        }
+        eprintln!(
+            "[kronos] TUN interface {dev_name} up: {local_vip_addr}/32, route {} dev {dev_name}{}",
+            tun::MESH_RANGE_STR,
+            if cfg.dns { ", mesh DNS on :53" } else { "" }
+        );
+        ring.push(format!("tun {dev_name} up ({local_vip_addr})"));
+        tun_teardown_name = Some(dev_name);
+    }
+
+    // Application sink: decrypted payloads addressed to this node.
+    // With host integration, IPv4 packets for our own VIP are written
+    // to the TUN device for the host stack to deliver; anything else
+    // (application payloads from `kronos send`) is logged as before.
+    let sink_tun_writer = tun_writer.clone();
     tokio::spawn(async move {
         while let Some((src, data)) = app_rx.recv().await {
+            if let Some(w) = &sink_tun_writer {
+                if tun::ipv4_dst(&data) == Some(local_vip_addr)
+                    && tun::write_packet_handle(w, &data).is_ok()
+                {
+                    continue;
+                }
+            }
             eprintln!(
                 "[kronos] packet from {src}: {} bytes",
                 data.len()
@@ -212,6 +292,8 @@ async fn run_up(cfg: Config) -> Result<()> {
     };
     let heartbeat_client = ControlClient::new(&cfg.control_url);
     let hb_tunnel = tunnel.clone();
+    let hb_names = name_table.clone();
+    let hb_self_name = cfg.node_name.clone();
     let hb_telemetry = telemetry.clone();
     let heartbeat_secs = cfg.heartbeat_secs;
     let heartbeat_handle = tokio::spawn(async move {
@@ -236,7 +318,15 @@ async fn run_up(cfg: Config) -> Result<()> {
                     .heartbeat(&node_id, &payload, node_token.as_deref())
                     .await
                 {
-                    Ok(resp) => hb_tunnel.update_peers(&resp.peers),
+                    Ok(resp) => {
+                        hb_tunnel.update_peers(&resp.peers);
+                        dns::update_names(
+                            &hb_names,
+                            &resp.peers,
+                            &hb_self_name,
+                            local_vip_addr,
+                        );
+                    }
                     Err(e) => eprintln!("[kronos] heartbeat failed: {e}"),
                 }
             }
@@ -273,10 +363,31 @@ async fn run_up(cfg: Config) -> Result<()> {
         }
     });
 
+    // Service gateway: this node can always be a stream TARGET (its
+    // event loop answers opens subject to policy); configured
+    // [[services]] forwards additionally serve local clients.
+    let gateway = Gateway::new(tunnel.clone(), cfg.role.clone());
+    if let Some(stream_rx) = tunnel.take_stream_receiver() {
+        gateway.spawn_event_loop(stream_rx);
+    }
+    for fwd in &cfg.services {
+        gateway.spawn_forward(fwd.clone());
+    }
+    if !cfg.services.is_empty() {
+        eprintln!(
+            "[kronos] gateway: {} service forward(s) configured",
+            cfg.services.len()
+        );
+    }
+
     tokio::signal::ctrl_c().await?;
     eprintln!("[kronos] shutting down");
     heartbeat_handle.abort();
     acl_handle.abort();
+    if let Some(name) = &tun_teardown_name {
+        tun::teardown(name);
+        eprintln!("[kronos] TUN interface {name} removed");
+    }
     Ok(())
 }
 

@@ -114,29 +114,49 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 /// Sends one STUN binding request and parses the (XOR-)MAPPED-ADDRESS.
 /// Returns None on any failure (no server configured, timeout, malformed
-/// response); callers fall back to the local socket address.
+/// or forged response); callers fall back to the local socket address.
+///
+/// The response is authenticated as far as STUN allows: it must arrive
+/// from the exact server endpoint we queried and carry the fresh random
+/// transaction ID of this request. (The previous implementation used a
+/// single hardcoded transaction ID for every request and ignored the
+/// response's source entirely, so any off-path datagram could have
+/// steered the node's advertised endpoint.)
 pub async fn stun_discover(server: &str) -> Option<SocketAddr> {
+    use rand_core::RngCore;
+    // Resolve first: the response is only trusted from this endpoint.
+    let server_addr = tokio::net::lookup_host(server).await.ok()?.next()?;
+    // A fresh random transaction ID per request (RFC 5389 section 6).
+    let mut txid = [0u8; 12];
+    rand_core::OsRng.fill_bytes(&mut txid);
     let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
     socket
-        .send_to(&build_stun_request(0xA5A5_1234_5678_9ABC_DEF0_1122_3344), server)
+        .send_to(&build_stun_request(&txid), server_addr)
         .await
         .ok()?;
     let mut buf = [0u8; 512];
     let recv = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await;
-    let (n, _) = recv.ok()?.ok()?;
-    parse_stun_response(&buf[..n])
+    let (n, from) = recv.ok()?.ok()?;
+    if from != server_addr {
+        return None;
+    }
+    parse_stun_response(&buf[..n], &txid)
 }
 
-fn build_stun_request(transaction_id: u128) -> [u8; 20] {
+fn build_stun_request(transaction_id: &[u8; 12]) -> [u8; 20] {
     let mut req = [0u8; 20];
     req[0..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
     req[2..4].copy_from_slice(&0u16.to_be_bytes());
     req[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    req[8..20].copy_from_slice(&transaction_id.to_be_bytes()[4..16]);
+    req[8..20].copy_from_slice(transaction_id);
     req
 }
 
-fn parse_stun_response(msg: &[u8]) -> Option<SocketAddr> {
+fn parse_stun_response(msg: &[u8], expected_txid: &[u8; 12]) -> Option<SocketAddr> {
+    // RFC 5389 section 6: a response only counts if it answers OUR
+    // request — binding-success type, the magic cookie, our exact
+    // transaction ID — and its declared length accounts for the whole
+    // datagram, no more and no less.
     if msg.len() < 20 {
         return None;
     }
@@ -144,12 +164,24 @@ fn parse_stun_response(msg: &[u8]) -> Option<SocketAddr> {
     if msg_type != STUN_BINDING_RESPONSE {
         return None;
     }
+    if msg[4..8] != STUN_MAGIC_COOKIE.to_be_bytes() {
+        return None;
+    }
+    if &msg[8..20] != expected_txid {
+        return None;
+    }
     let msg_len = u16::from_be_bytes(msg[2..4].try_into().ok()?) as usize;
-    let end = (20 + msg_len).min(msg.len());
+    if !msg_len.is_multiple_of(4) || 20 + msg_len != msg.len() {
+        return None;
+    }
+    let end = 20 + msg_len;
     let mut offset = 20;
     while offset + 4 <= end {
         let attr_type = u16::from_be_bytes(msg[offset..offset + 2].try_into().ok()?);
         let attr_len = u16::from_be_bytes(msg[offset + 2..offset + 4].try_into().ok()?) as usize;
+        if offset + 4 + attr_len > end {
+            return None;
+        }
         let value = msg.get(offset + 4..offset + 4 + attr_len)?;
         if (attr_type == ATTR_MAPPED_ADDRESS || attr_type == ATTR_XOR_MAPPED_ADDRESS)
             && value.len() >= 8
@@ -219,9 +251,34 @@ mod tests {
 
     #[test]
     fn stun_request_is_well_formed() {
-        let req = build_stun_request(7);
+        let txid = [7u8; 12];
+        let req = build_stun_request(&txid);
         assert_eq!(&req[0..2], &STUN_BINDING_REQUEST.to_be_bytes());
         assert_eq!(&req[4..8], &STUN_MAGIC_COOKIE.to_be_bytes());
+        assert_eq!(&req[8..20], &txid);
+    }
+
+    /// Builds a syntactically valid binding response carrying a
+    /// XOR-MAPPED-ADDRESS for 203.0.113.7:51820 with the given txid.
+    fn valid_response(txid: &[u8; 12]) -> Vec<u8> {
+        let port_xor = 51820u16 ^ 0x2112;
+        let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        let ip = [203u8, 0, 113, 7];
+        let mut xip = [0u8; 4];
+        for i in 0..4 {
+            xip[i] = ip[i] ^ cookie[i];
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        msg.extend_from_slice(&12u16.to_be_bytes());
+        msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        msg.extend_from_slice(txid);
+        msg.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        msg.extend_from_slice(&8u16.to_be_bytes());
+        msg.extend_from_slice(&[0, 0x01]);
+        msg.extend_from_slice(&port_xor.to_be_bytes());
+        msg.extend_from_slice(&xip);
+        msg
     }
 
     #[test]
@@ -245,13 +302,50 @@ mod tests {
         msg.extend_from_slice(&[0, 0x01]);
         msg.extend_from_slice(&port_xor.to_be_bytes());
         msg.extend_from_slice(&xip);
-        let addr = parse_stun_response(&msg).unwrap();
+        let addr = parse_stun_response(&msg, &[0x55u8; 12]).unwrap();
         assert_eq!(addr.to_string(), "203.0.113.7:51820");
     }
 
     #[test]
+    fn rejects_forged_or_malformed_responses() {
+        let txid = [0x42u8; 12];
+        let good = valid_response(&txid);
+        assert!(parse_stun_response(&good, &txid).is_some());
+
+        // A response to a DIFFERENT request (wrong transaction ID) is
+        // a forgery or a stray packet: never accepted.
+        assert!(parse_stun_response(&good, &[0x99u8; 12]).is_none());
+        let mut other_txid = good.clone();
+        other_txid[8] ^= 0xFF;
+        assert!(parse_stun_response(&other_txid, &txid).is_none());
+
+        // Wrong magic cookie.
+        let mut bad_cookie = good.clone();
+        bad_cookie[5] ^= 0xFF;
+        assert!(parse_stun_response(&bad_cookie, &txid).is_none());
+
+        // A binding REQUEST is not a response.
+        let mut as_request = good.clone();
+        as_request[0..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+        assert!(parse_stun_response(&as_request, &txid).is_none());
+
+        // Truncated datagram (declared length no longer accounts for it).
+        assert!(parse_stun_response(&good[..good.len() - 4], &txid).is_none());
+
+        // Trailing garbage (declared length shorter than the datagram).
+        let mut padded = good.clone();
+        padded.extend_from_slice(&[0u8; 4]);
+        assert!(parse_stun_response(&padded, &txid).is_none());
+
+        // Attribute claiming more bytes than the message holds.
+        let mut overrun = good.clone();
+        overrun[22..24].copy_from_slice(&100u16.to_be_bytes());
+        assert!(parse_stun_response(&overrun, &txid).is_none());
+    }
+
+    #[test]
     fn rejects_garbage_responses() {
-        assert!(parse_stun_response(&[0u8; 4]).is_none());
-        assert!(parse_stun_response(&[0xFFu8; 64]).is_none());
+        assert!(parse_stun_response(&[0u8; 4], &[0u8; 12]).is_none());
+        assert!(parse_stun_response(&[0xFFu8; 64], &[0u8; 12]).is_none());
     }
 }

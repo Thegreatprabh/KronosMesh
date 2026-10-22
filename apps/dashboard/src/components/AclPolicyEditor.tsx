@@ -174,7 +174,11 @@ export default function AclPolicyEditor({ policy, roles, readOnly, onCreate, onD
             Semantics: a matching DENY always overrides an ALLOW, whatever
             the priority (priority only orders this list and picks which
             DENY is reported). Traffic with no matching ALLOW is denied by
-            default.
+            default. Enforcement: DATA PLANE rules (service * or mesh-data,
+            port 0) are enforced by every tunnel for raw mesh data;
+            SERVICE GATEWAY rules are enforced by daemon gateways — on
+            both ends — for service streams using a configured forward
+            ([[services]] in the node config).
           </p>
           {readOnly && (
             <p className="mt-2 text-xs text-amber">
@@ -212,6 +216,16 @@ export default function AclPolicyEditor({ policy, roles, readOnly, onCreate, onD
                   {rule.action}
                 </span>
                 <span className="ml-2 text-slate-500">prio {rule.priority}</span>
+                {(rule.dest_service === '*' || rule.dest_service === 'mesh-data') &&
+                rule.port === 0 ? (
+                  <span className="ml-2 rounded bg-slate-500/10 px-1.5 py-0.5 font-semibold text-slate-400">
+                    DATA PLANE
+                  </span>
+                ) : (
+                  <span className="ml-2 rounded bg-neon/10 px-1.5 py-0.5 font-semibold text-neon">
+                    SERVICE GATEWAY
+                  </span>
+                )}
               </div>
               <button
                 onClick={() => void onDelete(rule.id)}
@@ -225,7 +239,7 @@ export default function AclPolicyEditor({ policy, roles, readOnly, onCreate, onD
           ))}
           {sorted.length === 0 && (
             <p className="py-6 text-center text-sm text-slate-500">
-              No policy rules — default posture is deny-all.
+              No policy rules — default-deny: no application data is allowed until a matching ALLOW rule is added.
             </p>
           )}
         </div>
