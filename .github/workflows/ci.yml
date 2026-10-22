@@ -40,3 +40,12 @@ jobs:
         run: |
           npm install
           npm run build
+
+  rust-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Daemon tests (ARM64)
+        working-directory: core/daemon
+        run: cargo test
