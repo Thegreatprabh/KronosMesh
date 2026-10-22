@@ -17,17 +17,21 @@ use kronos_daemon::config::{
 };
 use kronos_daemon::control_client::{discover_endpoint, ControlClient};
 use kronos_daemon::dns;
+use kronos_daemon::ebpf_loader::{EbpfLoader, EventRing, TelemetryCounters};
 use kronos_daemon::gateway::Gateway;
 use kronos_daemon::tun::{self, TunDevice};
-use std::net::Ipv4Addr;
-use kronos_daemon::ebpf_loader::{EbpfLoader, EventRing, TelemetryCounters};
 use kronos_daemon::tunnel::{MemoryHub, Tunnel};
 use kronos_daemon::wire::{AclRule, HeartbeatPayload, NodeRegisterRequest};
+use std::net::Ipv4Addr;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
-#[command(name = "kronos-daemon", version, about = "KronosMesh zero-trust mesh node daemon")]
+#[command(
+    name = "kronos-daemon",
+    version,
+    about = "KronosMesh zero-trust mesh node daemon"
+)]
 struct Cli {
     /// Path to a TOML config file.
     #[arg(long, global = true)]
@@ -67,9 +71,7 @@ fn main() -> Result<()> {
         Commands::Up => runtime.block_on(run_up(cfg)),
         Commands::Status => runtime.block_on(run_status(cfg)),
         Commands::Peers => runtime.block_on(run_peers(cfg)),
-        Commands::Bench { seconds, payload } => {
-            runtime.block_on(run_bench(seconds, payload))
-        }
+        Commands::Bench { seconds, payload } => runtime.block_on(run_bench(seconds, payload)),
     }
 }
 
@@ -153,7 +155,10 @@ async fn run_up(cfg: Config) -> Result<()> {
         .control_token
         .clone()
         .or_else(|| existing.as_ref().and_then(|s| s.node_token.clone()));
-    let registration = match client.register(&register_req, register_token.as_deref()).await {
+    let registration = match client
+        .register(&register_req, register_token.as_deref())
+        .await
+    {
         Ok(r) => {
             eprintln!(
                 "[kronos] registered with control plane as {} (vip {})",
@@ -232,10 +237,12 @@ async fn run_up(cfg: Config) -> Result<()> {
     let mut tun_teardown_name: Option<String> = None;
     let mut tun_writer = None;
     if cfg.tun {
-        let device = TunDevice::create(&cfg.interface).context("TUN setup")?;
+        // Create + configure is atomic from here on: a failure
+        // rolls the partial setup back (see tun::TunDevice::setup),
+        // so a fatal exit never leaves a half-configured interface.
+        let device =
+            TunDevice::setup(&cfg.interface, local_vip_addr, cfg.mtu).context("TUN setup")?;
         let dev_name = device.name().to_string();
-        tun::configure(&dev_name, local_vip_addr, cfg.mtu)
-            .context("TUN address/route setup")?;
         let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<(Ipv4Addr, Vec<u8>)>(256);
         tun_writer = Some(device.writer_handle());
         tun::spawn_pump(device, local_vip_addr, pkt_tx);
@@ -279,10 +286,7 @@ async fn run_up(cfg: Config) -> Result<()> {
                     continue;
                 }
             }
-            eprintln!(
-                "[kronos] packet from {src}: {} bytes",
-                data.len()
-            );
+            eprintln!("[kronos] packet from {src}: {} bytes", data.len());
         }
     });
 
@@ -320,12 +324,7 @@ async fn run_up(cfg: Config) -> Result<()> {
                 {
                     Ok(resp) => {
                         hb_tunnel.update_peers(&resp.peers);
-                        dns::update_names(
-                            &hb_names,
-                            &resp.peers,
-                            &hb_self_name,
-                            local_vip_addr,
-                        );
+                        dns::update_names(&hb_names, &resp.peers, &hb_self_name, local_vip_addr);
                     }
                     Err(e) => eprintln!("[kronos] heartbeat failed: {e}"),
                 }
@@ -350,8 +349,7 @@ async fn run_up(cfg: Config) -> Result<()> {
                     acl_tunnel.update_acls(&policy.rules);
                     let _ = std::fs::write(
                         acl_dir.join("acls.json"),
-                        serde_json::to_string_pretty(&policy)
-                            .unwrap_or_default(),
+                        serde_json::to_string_pretty(&policy).unwrap_or_default(),
                     );
                     eprintln!(
                         "[kronos] ACL policy updated to version {} ({} rules)",
@@ -496,10 +494,7 @@ async fn run_bench(seconds: u64, payload_size: usize) -> Result<()> {
     let recv_counter = counter.clone();
     let recv_task = tokio::spawn(async move {
         while let Some((_src, data)) = rx_b.recv().await {
-            recv_counter.fetch_add(
-                data.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            recv_counter.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     });
     let start = Instant::now();

@@ -157,6 +157,20 @@ mod imp {
             Ok(Self { name, file, writer })
         }
 
+        /// Creates a device and fully configures it (address, up,
+        /// mesh route). On any failure the partial setup is rolled
+        /// back (see `configure`) and the device is dropped, so the
+        /// caller either gets a working interface or nothing.
+        pub fn setup(requested_name: &str, vip: Ipv4Addr, mtu: u16) -> Result<Self> {
+            let device = Self::create(requested_name)?;
+            let name = device.name().to_string();
+            if let Err(e) = configure(&name, vip, mtu) {
+                drop(device);
+                return Err(e);
+            }
+            Ok(device)
+        }
+
         pub fn name(&self) -> &str {
             &self.name
         }
@@ -201,12 +215,26 @@ mod imp {
 
     /// Assigns the VIP, brings the interface up with the tunnel MTU,
     /// and routes the whole mesh range into it.
+    ///
+    /// Failure handling: if ANY step fails, everything this call (or
+    /// a previous partial attempt) set up is rolled back — the
+    /// route and the interface are removed — before the error is
+    /// returned. A half-configured interface (address assigned but
+    /// no route, or up with no address) is never left behind for the
+    /// operator or a later retry to trip over.
     pub fn configure(name: &str, vip: Ipv4Addr, mtu: u16) -> Result<()> {
-        run_ip(&["addr", "add", &format!("{vip}/32"), "dev", name])
-            .context("assign TUN address")?;
-        run_ip(&["link", "set", name, "up", "mtu", &mtu.to_string()])
-            .context("bring TUN interface up")?;
-        run_ip(&["route", "add", MESH_RANGE_STR, "dev", name]).context("add mesh route")?;
+        let attempt = (|| -> Result<()> {
+            run_ip(&["addr", "add", &format!("{vip}/32"), "dev", name])
+                .context("assign TUN address")?;
+            run_ip(&["link", "set", name, "up", "mtu", &mtu.to_string()])
+                .context("bring TUN interface up")?;
+            run_ip(&["route", "add", MESH_RANGE_STR, "dev", name]).context("add mesh route")?;
+            Ok(())
+        })();
+        if let Err(e) = attempt {
+            teardown(name);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -269,6 +297,9 @@ mod stub {
         pub fn create(_requested_name: &str) -> Result<Self> {
             bail!("TUN host integration is implemented for Linux only in this release")
         }
+        pub fn setup(_requested_name: &str, _vip: Ipv4Addr, _mtu: u16) -> Result<Self> {
+            bail!("TUN host integration is implemented for Linux only in this release")
+        }
         pub fn name(&self) -> &str {
             ""
         }
@@ -304,6 +335,20 @@ mod stub {
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::{configure, spawn_pump, teardown, write_packet_handle, TunDevice};
+
+/// Host-network tests mutate shared kernel state — a TUN device,
+/// an address, and the mesh route — and some kernels refuse the
+/// same route prefix via two devices at once, so tests that touch
+/// real host networking must hold this lock for their whole run
+/// instead of racing each other. Poison-tolerant: a panicking
+/// sibling test must not cascade.
+#[cfg(test)]
+pub(crate) static HOST_NET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn host_net_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    HOST_NET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(test)]
 mod tests {
@@ -352,6 +397,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn real_tun_device_icmp_roundtrip() {
+        let _host_net = super::host_net_test_lock();
         let name = format!("krt{}", std::process::id() % 100_000);
         let vip: Ipv4Addr = "100.127.0.1".parse().unwrap();
         let device = match TunDevice::create(&name) {
@@ -369,6 +415,80 @@ mod tests {
         }
         icmp_roundtrip(device, vip).unwrap();
         teardown(&dev_name);
+    }
+
+    /// Failure injection for the setup rollback: a configure()
+    /// that fails partway — at the FIRST step or at the LAST —
+    /// must leave nothing behind: the interface itself is removed,
+    /// not left half-configured for the operator or a retry.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn tun_configure_failure_rolls_back_everything() {
+        let _host_net = super::host_net_test_lock();
+        fn link_exists(name: &str) -> bool {
+            std::process::Command::new("ip")
+                .args(["link", "show", "dev", name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        let pid = std::process::id() % 100_000;
+
+        // Scenario 1: re-configuring a live interface fails at
+        // step 1 (address already assigned).
+        let name1 = format!("krf{pid}a");
+        let vip1: Ipv4Addr = "100.127.1.1".parse().unwrap();
+        let dev1 = match TunDevice::create(&name1) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP tun_configure_failure_rolls_back_everything: {e}");
+                return;
+            }
+        };
+        let n1 = dev1.name().to_string();
+        configure(&n1, vip1, 1400).expect("first configure must succeed");
+        assert!(link_exists(&n1));
+        let again = configure(&n1, vip1, 1400);
+        assert!(
+            again.is_err(),
+            "second configure must fail (address exists)"
+        );
+        assert!(
+            !link_exists(&n1),
+            "rollback must remove the interface after a step-1 failure"
+        );
+        drop(dev1);
+
+        // Scenario 2: pre-install the mesh route by hand so
+        // configure() passes steps 1-2 and fails at step 3 (the
+        // route add reports File exists).
+        let name2 = format!("krf{pid}b");
+        let vip2: Ipv4Addr = "100.127.1.2".parse().unwrap();
+        let dev2 = match TunDevice::create(&name2) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP rollback scenario 2: {e}");
+                return;
+            }
+        };
+        let n2 = dev2.name().to_string();
+        let up = std::process::Command::new("ip")
+            .args(["link", "set", &n2, "up"])
+            .output()
+            .expect("ip link set up");
+        assert!(up.status.success(), "manual link-up must succeed");
+        let pre = std::process::Command::new("ip")
+            .args(["route", "add", "100.64.0.0/10", "dev", &n2])
+            .output()
+            .expect("ip route add");
+        assert!(pre.status.success(), "manual route add must succeed");
+        let again2 = configure(&n2, vip2, 1400);
+        assert!(again2.is_err(), "configure must fail at the route step");
+        assert!(
+            !link_exists(&n2),
+            "rollback must remove the interface after a step-3 failure"
+        );
+        drop(dev2);
     }
 
     #[cfg(target_os = "linux")]

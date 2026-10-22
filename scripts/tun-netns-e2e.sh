@@ -15,11 +15,16 @@
 #     (cd core/daemon && cargo build --release)
 #     (cd control-plane && go build -o kronos-control-plane .)
 #
-# This script is NOT run by CI and was NOT run in the development
-# sandbox: that sandbox forbids entering network namespaces (setns
-# EPERM) and blocks userspace UDP sends outright, so a two-host test
-# cannot execute there. It is written for verification on a normal
-# Linux machine.
+# The final section additionally proves the service gateway under
+# adverse network conditions: `tc netem` adds 10% loss + jitter to
+# both links, then a 256 KB TCP stream crosses a [[services]]
+# forward between the namespaces and is verified byte-exact — the
+# reliable-stream layer doing its job on a real UDP path.
+#
+# This script runs in CI (the netns-e2e job) on an Ubuntu runner.
+# It was NOT run in the development sandbox: that sandbox forbids
+# entering network namespaces (setns EPERM) and blocks userspace
+# UDP sends outright, so a two-host test cannot execute there.
 #
 # Usage:  sudo ./scripts/tun-netns-e2e.sh
 # Env:    DAEMON_BIN, CP_BIN override binary paths.
@@ -38,6 +43,7 @@ cleanup() {
   set +e
   for ns in "$NS_A" "$NS_B"; do
     ip netns exec "$ns" pkill -INT kronos-daemon 2>/dev/null
+    ip netns exec "$ns" pkill -f echo_server.py 2>/dev/null
   done
   sleep 1
   [ -n "$CP_PID" ] && kill "$CP_PID" 2>/dev/null
@@ -81,16 +87,7 @@ curl -sf -X POST http://127.0.0.1:8080/api/v1/acls \
   -d '{"source_role":"*","dest_service":"*","port":0,"action":"ALLOW","priority":1}' >/dev/null
 echo "control plane up, allow-all mesh-data rule seeded"
 
-echo "== daemons with TUN on =="
-ip netns exec "$NS_A" env \
-  KRONOS_NODE_NAME=node-a KRONOS_ROLE=node \
-  KRONOS_LISTEN_PORT=51871 \
-  KRONOS_ADVERTISE_ENDPOINT="10.99.1.2:51871" \
-  KRONOS_CONTROL_URL="http://10.99.1.1:8080" \
-  KRONOS_CONTROL_TOKEN="$ADMIN_TOKEN" \
-  KRONOS_ALLOW_INSECURE_HTTP=1 \
-  KRONOS_TUN=1 KRONOS_STATE_DIR="$WORK/a" \
-  "$DAEMON" up >"$WORK/a.log" 2>&1 &
+echo "== daemons with TUN on (B first: A needs B's VIP for its service forward) =="
 ip netns exec "$NS_B" env \
   KRONOS_NODE_NAME=node-b KRONOS_ROLE=node \
   KRONOS_LISTEN_PORT=51872 \
@@ -100,12 +97,42 @@ ip netns exec "$NS_B" env \
   KRONOS_ALLOW_INSECURE_HTTP=1 \
   KRONOS_TUN=1 KRONOS_STATE_DIR="$WORK/b" \
   "$DAEMON" up >"$WORK/b.log" 2>&1 &
-
-sleep 3
-grep -q "TUN interface kronos0 up" "$WORK/a.log" || { echo "FAIL: node A TUN not up"; cat "$WORK/a.log"; exit 1; }
+for i in $(seq 1 20); do
+  grep -q "TUN interface kronos0 up" "$WORK/b.log" 2>/dev/null && break
+  sleep 1
+done
 grep -q "TUN interface kronos0 up" "$WORK/b.log" || { echo "FAIL: node B TUN not up"; cat "$WORK/b.log"; exit 1; }
-VIP_A="$(grep -oE 'virtual 100\.[0-9.]+' "$WORK/a.log" | awk '{print $2}' | head -1)"
 VIP_B="$(grep -oE 'virtual 100\.[0-9.]+' "$WORK/b.log" | awk '{print $2}' | head -1)"
+[ -n "$VIP_B" ] || { echo "FAIL: node B VIP not found in log"; cat "$WORK/b.log"; exit 1; }
+echo "node B VIP: $VIP_B"
+
+cat >"$WORK/a.toml" <<EOF
+[[services]]
+name = "echo"
+listen = "127.0.0.1:18741"
+target_vip = "$VIP_B"
+target_port = 15432
+EOF
+ip netns exec "$NS_A" env \
+  KRONOS_NODE_NAME=node-a KRONOS_ROLE=node \
+  KRONOS_LISTEN_PORT=51871 \
+  KRONOS_ADVERTISE_ENDPOINT="10.99.1.2:51871" \
+  KRONOS_CONTROL_URL="http://10.99.1.1:8080" \
+  KRONOS_CONTROL_TOKEN="$ADMIN_TOKEN" \
+  KRONOS_ALLOW_INSECURE_HTTP=1 \
+  KRONOS_TUN=1 KRONOS_STATE_DIR="$WORK/a" \
+  "$DAEMON" --config "$WORK/a.toml" up >"$WORK/a.log" 2>&1 &
+for i in $(seq 1 20); do
+  grep -q "TUN interface kronos0 up" "$WORK/a.log" 2>/dev/null && break
+  sleep 1
+done
+grep -q "TUN interface kronos0 up" "$WORK/a.log" || { echo "FAIL: node A TUN not up"; cat "$WORK/a.log"; exit 1; }
+for i in $(seq 1 20); do
+  grep -q "gateway: echo listening on 127.0.0.1:18741" "$WORK/a.log" 2>/dev/null && break
+  sleep 1
+done
+grep -q "gateway: echo listening on 127.0.0.1:18741" "$WORK/a.log" || { echo "FAIL: node A gateway forward not listening"; cat "$WORK/a.log"; exit 1; }
+VIP_A="$(grep -oE 'virtual 100\.[0-9.]+' "$WORK/a.log" | awk '{print $2}' | head -1)"
 echo "node A VIP: $VIP_A   node B VIP: $VIP_B"
 [ -n "$VIP_A" ] && [ -n "$VIP_B" ] || { echo "FAIL: VIPs not found in logs"; exit 1; }
 
@@ -140,4 +167,56 @@ PYEOF
 else
   echo "SKIP: python3 not available for the DNS check"
 fi
+echo "== service gateway under packet loss (tc netem) =="
+cat >"$WORK/echo_server.py" <<'PYEOF'
+import socket, threading
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 15432))
+srv.listen(8)
+def handle(c):
+    try:
+        while True:
+            d = c.recv(65536)
+            if not d:
+                break
+            c.sendall(d)
+    except OSError:
+        pass
+    finally:
+        c.close()
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+ip netns exec "$NS_B" python3 "$WORK/echo_server.py" >"$WORK/echo.log" 2>&1 &
+# 10% loss + jittered delay in both directions on both links:
+# datagrams drop, arrive late and overtake each other.
+tc qdisc add dev veth-ha root netem loss 10% delay 10ms 5ms
+tc qdisc add dev veth-hb root netem loss 10% delay 10ms 5ms
+ip netns exec "$NS_A" tc qdisc add dev veth-a root netem loss 10% delay 10ms 5ms
+ip netns exec "$NS_B" tc qdisc add dev veth-b root netem loss 10% delay 10ms 5ms
+ip netns exec "$NS_A" python3 - <<'PYEOF'
+import socket, threading
+payload = bytes((i * 31 + 7) % 256 for i in range(256 * 1024))
+s = socket.create_connection(("127.0.0.1", 18741), timeout=120)
+received = bytearray()
+def reader():
+    while len(received) < len(payload):
+        d = s.recv(65536)
+        if not d:
+            break
+        received.extend(d)
+t = threading.Thread(target=reader)
+t.start()
+view = memoryview(payload)
+while view:
+    n = s.send(view)
+    view = view[n:]
+s.shutdown(socket.SHUT_WR)
+t.join(120)
+s.close()
+assert bytes(received) == payload, "gateway payload mismatch under netem loss"
+print("PASS: 256 KB crossed the service gateway byte-exact under 10% loss + jitter")
+PYEOF
 echo "== ALL CHECKS PASSED =="

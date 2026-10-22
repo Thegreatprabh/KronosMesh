@@ -15,24 +15,49 @@
 //! - The RECEIVING gateway checks the policy again for (sender role
 //!   -> service:port) before dialing the local service at
 //!   127.0.0.1:port. A denied or unreachable target is answered with
-//!   a stream close, never with data.
+//!   a stream RESET, never with data.
 //!
 //! Both checks call the same `acl_decision` the data plane uses, so
 //! deny-override + default-deny semantics are identical everywhere.
 //!
-//! v1 limits, stated plainly: streams have no flow control beyond the
-//! bounded queues (intended for low-rate service traffic, not bulk
-//! transfer), no idle timeout, and the frame transport is unordered —
-//! if stream data ever outruns its OPEN frame, the receiver answers
-//! CLOSE for the unknown stream instead of silently corrupting it,
-//! so the failure is visible to the local client as a disconnect.
+//! ## Reliability (v2 streams)
+//!
+//! The mesh transport is UDP: frames can be lost, duplicated and
+//! reordered. TCP services (SSH, PostgreSQL, ...) assume the byte
+//! stream under them is reliable and ordered, so the tunnel's stream
+//! layer provides exactly that — per-direction sequence numbers,
+//! cumulative ACKs, retransmission, and a bounded sender window (see
+//! `tunnel.rs`). The gateway's part of the contract:
+//!
+//! - The TCP -> mesh pump AWAITS `send_stream_data`; when the
+//!   window is full the pump stops reading the socket, so TCP's own
+//!   flow control throttles the local sender. Nothing is ever
+//!   dropped to make progress — there is no try_send on this path.
+//! - The mesh -> TCP pump pulls ordered payloads from
+//!   `next_stream_data`; the tunnel only releases bytes in sequence
+//!   and only as fast as this pump consumes them (consumption IS the
+//!   receive window), so a slow local reader backpressures the far
+//!   sender end to end.
+//! - Local EOF sends a stream CLOSE that is retransmitted until the
+//!   peer acknowledges it complete: every queued byte is delivered
+//!   before the peer's consumer sees end-of-stream.
+//! - Directions close independently (TCP half-close): a stream
+//!   half is torn down only when BOTH pumps have finished, so a
+//!   client that sends a request and half-closes still receives the
+//!   full reply. A RESET is the only immediate teardown.
+//!
+//! Remaining v2 limits, stated plainly: no idle timeout (a stream
+//! lives as long as both TCP endpoints do), and both peers must run
+//! a daemon with the v2 stream protocol — the frame format changed
+//! (sequence numbers), so v1 and v2 gateways do not interoperate.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use rand_core::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -41,7 +66,6 @@ use crate::config::ServiceForward;
 use crate::tunnel::{acl_decision, AclDecision, StreamEvent, Transport, Tunnel};
 
 const CHUNK: usize = 16_384;
-const STREAM_QUEUE: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Dir {
@@ -52,8 +76,11 @@ enum Dir {
 }
 
 struct StreamHalf {
-    to_tcp: mpsc::Sender<Vec<u8>>,
     aborts: Vec<AbortHandle>,
+    /// Pumps still running (one per direction). The half is torn
+    /// down when BOTH pumps have finished — never when just one
+    /// direction ends (TCP half-close semantics).
+    pumps_left: Arc<AtomicUsize>,
 }
 
 /// Live streams keyed by (peer VIP, stream id, direction).
@@ -82,7 +109,65 @@ impl<T: Transport> Gateway<T> {
         acl_decision(&self.tunnel.acl_snapshot(), source_role, service, port) == AclDecision::Allow
     }
 
-    fn close_stream(&self, peer_vip: &str, stream_id: u32, dir: Dir) {
+    /// Registers a stream half before its pumps start, so a pump
+    /// that ends instantly still finds (and cleans) its entry.
+    fn register_stream(&self, peer_vip: &str, stream_id: u32, dir: Dir) {
+        self.streams.lock().unwrap().insert(
+            (peer_vip.to_string(), stream_id, dir),
+            StreamHalf {
+                aborts: Vec::new(),
+                pumps_left: Arc::new(AtomicUsize::new(2)),
+            },
+        );
+    }
+
+    /// Attaches pump abort handles to a registered half. If the
+    /// half is already gone (a pump ended and tore the stream down
+    /// first), the pumps are aborted immediately instead.
+    fn attach_aborts(&self, peer_vip: &str, stream_id: u32, dir: Dir, handles: Vec<AbortHandle>) {
+        let key = (peer_vip.to_string(), stream_id, dir);
+        let mut map = self.streams.lock().unwrap();
+        match map.get_mut(&key) {
+            Some(half) => half.aborts.extend(handles),
+            None => {
+                for h in handles {
+                    h.abort();
+                }
+            }
+        }
+    }
+
+    /// A pump finished. The stream half is torn down only when
+    /// BOTH pumps are done: one direction ending must never kill
+    /// the other direction's in-flight data (a client that sends a
+    /// request and half-closes still expects the full reply). The
+    /// one exception is a RESET: the peer is gone, so the sibling
+    /// pump is aborted immediately instead of being left blocked on
+    /// a silent local socket.
+    fn pump_finished(&self, peer_vip: &str, stream_id: u32, dir: Dir, abort_sibling: bool) {
+        if abort_sibling {
+            self.teardown_stream(peer_vip, stream_id, dir);
+            return;
+        }
+        let key = (peer_vip.to_string(), stream_id, dir);
+        let last = {
+            let map = self.streams.lock().unwrap();
+            match map.get(&key) {
+                Some(half) => half.pumps_left.fetch_sub(1, AtomicOrdering::SeqCst) == 1,
+                None => false,
+            }
+        };
+        if last {
+            self.streams.lock().unwrap().remove(&key);
+            self.tunnel.drop_in_stream(peer_vip, stream_id);
+        }
+    }
+
+    /// Immediate teardown: aborts both pumps and drops the tunnel's
+    /// inbound state. The outbound direction is NOT dropped here:
+    /// if a CLOSE was sent, its retransmission lifecycle finishes
+    /// the close reliably on its own.
+    fn teardown_stream(&self, peer_vip: &str, stream_id: u32, dir: Dir) {
         let half = self
             .streams
             .lock()
@@ -92,15 +177,8 @@ impl<T: Transport> Gateway<T> {
             for a in &half.aborts {
                 a.abort();
             }
-            // Dropping `half` closes to_tcp, ending the writer task.
         }
-    }
-
-    fn stream_alive(&self, peer_vip: &str, stream_id: u32, dir: Dir) -> bool {
-        self.streams
-            .lock()
-            .unwrap()
-            .contains_key(&(peer_vip.to_string(), stream_id, dir))
+        self.tunnel.drop_in_stream(peer_vip, stream_id);
     }
 
     /// Serves one configured forward until the listener dies.
@@ -125,6 +203,75 @@ impl<T: Transport> Gateway<T> {
         });
     }
 
+    /// TCP -> mesh pump: reads the local socket and sends each chunk
+    /// on the reliable stream. When the stream's send window is
+    /// full, `send_stream_data` waits — the pump stops reading, and
+    /// TCP flow control does the rest. On local EOF it sends the
+    /// (reliably retransmitted) stream CLOSE and ends; the mesh ->
+    /// TCP direction keeps flowing until the peer ends it.
+    fn spawn_tcp_pump(
+        self: &Arc<Self>,
+        peer_vip: String,
+        stream_id: u32,
+        dir: Dir,
+        mut rd: OwnedReadHalf,
+    ) -> AbortHandle {
+        let gw = self.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if gw
+                            .tunnel
+                            .send_stream_data(&peer_vip, stream_id, &buf[..n])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = gw.tunnel.send_stream_close(&peer_vip, stream_id).await;
+            gw.pump_finished(&peer_vip, stream_id, dir, false);
+        })
+        .abort_handle()
+    }
+
+    /// Mesh -> TCP pump: pulls ordered payloads and writes them to
+    /// the local socket. This pump's pace is the receive window:
+    /// the tunnel releases (and acknowledges) stream bytes only as
+    /// fast as they are consumed here. When the stream ends — the
+    /// peer's CLOSE fully delivered, or a RESET — it shuts the
+    /// socket's write side down and tears the half down.
+    fn spawn_mesh_pump(
+        self: &Arc<Self>,
+        peer_vip: String,
+        stream_id: u32,
+        dir: Dir,
+        mut wr: OwnedWriteHalf,
+    ) -> AbortHandle {
+        let gw = self.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = gw.tunnel.next_stream_data(&peer_vip, stream_id).await {
+                if wr.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+            // Half-close: shut down the socket's write side (the
+            // local endpoint sees a clean EOF after the last byte),
+            // then finish. The sibling pump keeps draining unless
+            // the stream was reset (peer gone).
+            let was_reset = gw.tunnel.stream_was_reset(&peer_vip, stream_id);
+            let _ = wr.shutdown().await;
+            gw.pump_finished(&peer_vip, stream_id, dir, was_reset);
+        })
+        .abort_handle()
+    }
+
     fn handle_local_conn(self: &Arc<Self>, stream: TcpStream, fwd: &ServiceForward) {
         let gw = self.clone();
         let fwd = fwd.clone();
@@ -139,53 +286,19 @@ impl<T: Transport> Gateway<T> {
                 return;
             }
             let stream_id = gw.next_id.fetch_add(1, AtomicOrdering::Relaxed);
-            let key = (fwd.target_vip.clone(), stream_id, Dir::Out);
-            let (mut rd, mut wr) = stream.into_split();
-            let (to_tcp_tx, mut to_tcp_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE);
-            let writer = tokio::spawn(async move {
-                while let Some(bytes) = to_tcp_rx.recv().await {
-                    if wr.write_all(&bytes).await.is_err() {
-                        break;
-                    }
-                }
-                let _ = wr.shutdown().await;
-            });
-            let gw_reader = gw.clone();
-            let fwd_reader = fwd.clone();
-            let reader = tokio::spawn(async move {
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    match rd.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if !gw_reader.stream_alive(&fwd_reader.target_vip, stream_id, Dir::Out)
-                            {
-                                break; // the far end closed the stream
-                            }
-                            if gw_reader
-                                .tunnel
-                                .send_stream_data(&fwd_reader.target_vip, stream_id, &buf[..n])
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = gw_reader
-                    .tunnel
-                    .send_stream_close(&fwd_reader.target_vip, stream_id)
-                    .await;
-                gw_reader.close_stream(&fwd_reader.target_vip, stream_id, Dir::Out);
-            });
-            gw.streams.lock().unwrap().insert(
-                key,
-                StreamHalf {
-                    to_tcp: to_tcp_tx,
-                    aborts: vec![writer.abort_handle(), reader.abort_handle()],
-                },
+            let (rd, wr) = stream.into_split();
+            gw.register_stream(&fwd.target_vip, stream_id, Dir::Out);
+            // The mesh pump starts BEFORE the OPEN is sent: it
+            // creates the tunnel's inbound state for the peer's
+            // direction, so a refusal RESET that races back can
+            // never arrive "before" the stream exists locally.
+            let mesh_handle = gw.spawn_mesh_pump(fwd.target_vip.clone(), stream_id, Dir::Out, wr);
+            let tcp_handle = gw.spawn_tcp_pump(fwd.target_vip.clone(), stream_id, Dir::Out, rd);
+            gw.attach_aborts(
+                &fwd.target_vip,
+                stream_id,
+                Dir::Out,
+                vec![mesh_handle, tcp_handle],
             );
             if let Err(e) = gw
                 .tunnel
@@ -196,13 +309,15 @@ impl<T: Transport> Gateway<T> {
                     "[kronos] gateway: stream open to {} failed: {e}",
                     fwd.target_vip
                 );
-                gw.close_stream(&fwd.target_vip, stream_id, Dir::Out);
+                gw.tunnel.reset_stream(&fwd.target_vip, stream_id).await;
+                gw.teardown_stream(&fwd.target_vip, stream_id, Dir::Out);
             }
         });
     }
 
-    /// Consumes tunnel stream events (inbound streams where this node
-    /// is the target).
+    /// Consumes tunnel stream OPEN events (inbound streams where
+    /// this node is the target). Stream data is pulled per stream by
+    /// the pumps, never pushed through this loop.
     pub fn spawn_event_loop(self: &Arc<Self>, mut rx: mpsc::Receiver<StreamEvent>) {
         let gw = self.clone();
         tokio::spawn(async move {
@@ -217,35 +332,6 @@ impl<T: Transport> Gateway<T> {
                     } => {
                         gw.handle_open(src_vip, src_role, stream_id, service, port)
                             .await;
-                    }
-                    StreamEvent::Data {
-                        src_vip,
-                        stream_id,
-                        data,
-                    } => {
-                        let sink = {
-                            let map = gw.streams.lock().unwrap();
-                            map.get(&(src_vip.clone(), stream_id, Dir::In))
-                                .or_else(|| map.get(&(src_vip.clone(), stream_id, Dir::Out)))
-                                .map(|h| h.to_tcp.clone())
-                        };
-                        match sink {
-                            Some(tx) => {
-                                let _ = tx.try_send(data);
-                            }
-                            None => {
-                                // Data for a stream we do not have:
-                                // answer CLOSE so the sender tears the
-                                // stream down visibly instead of
-                                // feeding a void (e.g. when the frames
-                                // overtook the OPEN).
-                                let _ = gw.tunnel.send_stream_close(&src_vip, stream_id).await;
-                            }
-                        }
-                    }
-                    StreamEvent::Close { src_vip, stream_id } => {
-                        gw.close_stream(&src_vip, stream_id, Dir::In);
-                        gw.close_stream(&src_vip, stream_id, Dir::Out);
                     }
                 }
             }
@@ -266,7 +352,7 @@ impl<T: Transport> Gateway<T> {
             eprintln!(
                 "[kronos] gateway: policy does not allow {src_role} -> {service}:{port} (default deny); stream from {src_vip} refused"
             );
-            let _ = self.tunnel.send_stream_close(&src_vip, stream_id).await;
+            self.tunnel.reset_stream(&src_vip, stream_id).await;
             return;
         }
         let stream = match TcpStream::connect(("127.0.0.1", port)).await {
@@ -275,56 +361,17 @@ impl<T: Transport> Gateway<T> {
                 eprintln!(
                     "[kronos] gateway: local service {service} on 127.0.0.1:{port} unreachable: {e}"
                 );
-                let _ = self.tunnel.send_stream_close(&src_vip, stream_id).await;
+                self.tunnel.reset_stream(&src_vip, stream_id).await;
                 return;
             }
         };
-        let (mut rd, mut wr) = stream.into_split();
-        let (to_tcp_tx, mut to_tcp_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE);
-        let writer = tokio::spawn(async move {
-            while let Some(bytes) = to_tcp_rx.recv().await {
-                if wr.write_all(&bytes).await.is_err() {
-                    break;
-                }
-            }
-            let _ = wr.shutdown().await;
-        });
-        let gw = self.clone();
-        let src = src_vip.clone();
-        let reader = tokio::spawn(async move {
-            let mut buf = vec![0u8; CHUNK];
-            loop {
-                match rd.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if !gw.stream_alive(&src, stream_id, Dir::In) {
-                            break;
-                        }
-                        if gw
-                            .tunnel
-                            .send_stream_data(&src, stream_id, &buf[..n])
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = gw.tunnel.send_stream_close(&src, stream_id).await;
-            gw.close_stream(&src, stream_id, Dir::In);
-        });
-        self.streams.lock().unwrap().insert(
-            (src_vip, stream_id, Dir::In),
-            StreamHalf {
-                to_tcp: to_tcp_tx,
-                aborts: vec![writer.abort_handle(), reader.abort_handle()],
-            },
-        );
+        let (rd, wr) = stream.into_split();
+        self.register_stream(&src_vip, stream_id, Dir::In);
+        let mesh_handle = self.spawn_mesh_pump(src_vip.clone(), stream_id, Dir::In, wr);
+        let tcp_handle = self.spawn_tcp_pump(src_vip.clone(), stream_id, Dir::In, rd);
+        self.attach_aborts(&src_vip, stream_id, Dir::In, vec![mesh_handle, tcp_handle]);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +574,243 @@ mod tests {
             0,
             "no stream may reach the target when the initiator denies"
         );
+    }
+
+    // -- gateway over a lossy, reordering transport ----------------------
+
+    use crate::tunnel::ChaosTransport;
+
+    async fn make_node_chaos(
+        hub: &Arc<MemoryHub>,
+        port: u16,
+        vip: &str,
+        role: &str,
+        rules: Vec<AclRule>,
+        seed: u64,
+    ) -> (Arc<Tunnel<ChaosTransport>>, Identity) {
+        let dir = std::env::temp_dir().join(format!(
+            "kronos-gwc-{}-{}",
+            std::process::id(),
+            vip.replace('.', "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let identity = Identity::load_or_create(&dir).unwrap();
+        let (tunnel, _rx) = Tunnel::bind_with_transport(
+            ChaosTransport::wrap(hub.register(addr(port)), seed, 10, 5),
+            Identity::load_or_create(&dir).unwrap(),
+            vip,
+            role,
+            Arc::new(TelemetryCounters::default()),
+            Arc::new(EventRing::new(64)),
+        )
+        .unwrap();
+        let mut all = vec![rule("data-allow", "*", "mesh-data", 0, "ALLOW")];
+        all.extend(rules);
+        tunnel.update_acls(&all);
+        (tunnel, identity)
+    }
+
+    async fn linked_pair_chaos(
+        a_rules: Vec<AclRule>,
+        b_rules: Vec<AclRule>,
+        base_port: u16,
+        vip_a: &'static str,
+        vip_b: &'static str,
+    ) -> (Arc<Tunnel<ChaosTransport>>, Arc<Tunnel<ChaosTransport>>) {
+        let hub = MemoryHub::new();
+        let (a, id_a) = make_node_chaos(&hub, base_port, vip_a, "edge", a_rules, 0xC0FF_EE01).await;
+        let (b, id_b) =
+            make_node_chaos(&hub, base_port + 1, vip_b, "node", b_rules, 0xC0FF_EE02).await;
+        a.add_peer(&id_b.public_hex(), vip_b, Some(b.local_addr()), "node");
+        b.add_peer(&id_a.public_hex(), vip_a, Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        (a, b)
+    }
+
+    fn pattern(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i * 31 + seed as usize * 17) % 251) as u8)
+            .collect()
+    }
+
+    fn assert_bytes_exact(got: &[u8], want: &[u8]) {
+        assert_eq!(got.len(), want.len(), "length mismatch");
+        if let Some(i) = got.iter().zip(want).position(|(x, y)| x != y) {
+            panic!(
+                "byte mismatch at offset {i}: got {} want {}",
+                got[i], want[i]
+            );
+        }
+    }
+
+    /// 256 KB through the gateway over the chaos transport (10%
+    /// loss, 5% duplication, 20% reordering) must come back
+    /// byte-exact — the SSH/PostgreSQL requirement.
+    #[tokio::test]
+    async fn gateway_bulk_transfer_over_chaos_is_byte_exact() {
+        let (echo_port, _accepted) = echo_server().await;
+        let allow = vec![rule("svc", "edge", "echo", echo_port, "ALLOW")];
+        let (a, b) =
+            linked_pair_chaos(allow.clone(), allow, 6441, "100.64.31.1", "100.64.31.2").await;
+        let gw_b = Gateway::new(b.clone(), "node".to_string());
+        gw_b.spawn_event_loop(b.take_stream_receiver().unwrap());
+        let gw_a = Gateway::new(a.clone(), "edge".to_string());
+        gw_a.spawn_event_loop(a.take_stream_receiver().unwrap());
+        gw_a.spawn_forward(ServiceForward {
+            name: "echo".to_string(),
+            listen: "127.0.0.1:18714".to_string(),
+            target_vip: "100.64.31.2".to_string(),
+            target_port: echo_port,
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let payload = pattern(256_000, 11);
+        let client = TcpStream::connect("127.0.0.1:18714").await.unwrap();
+        let (mut rd, mut wr) = client.into_split();
+        let send_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            wr.write_all(&send_payload).await.unwrap();
+        });
+        let mut received = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(60), rd.read_exact(&mut received))
+            .await
+            .expect("bulk echo timed out over chaos")
+            .expect("bulk echo read failed");
+        writer.await.unwrap();
+        assert_bytes_exact(&received, &payload);
+    }
+
+    /// A consumer that reads nothing for two seconds, then reads
+    /// slowly: the tunnel's in-flight buffering (~256 KB per
+    /// direction) is far smaller than the 512 KB payload, so
+    /// backpressure MUST engage — and still not one byte is lost.
+    #[tokio::test]
+    async fn gateway_slow_consumer_loses_nothing() {
+        let (echo_port, _accepted) = echo_server().await;
+        let allow = vec![rule("svc", "edge", "echo", echo_port, "ALLOW")];
+        let (a, b) =
+            linked_pair_chaos(allow.clone(), allow, 6451, "100.64.32.1", "100.64.32.2").await;
+        let gw_b = Gateway::new(b.clone(), "node".to_string());
+        gw_b.spawn_event_loop(b.take_stream_receiver().unwrap());
+        let gw_a = Gateway::new(a.clone(), "edge".to_string());
+        gw_a.spawn_event_loop(a.take_stream_receiver().unwrap());
+        gw_a.spawn_forward(ServiceForward {
+            name: "echo".to_string(),
+            listen: "127.0.0.1:18715".to_string(),
+            target_vip: "100.64.32.2".to_string(),
+            target_port: echo_port,
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let payload = pattern(512_000, 13);
+        let client = TcpStream::connect("127.0.0.1:18715").await.unwrap();
+        let (mut rd, mut wr) = client.into_split();
+        let send_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            wr.write_all(&send_payload).await.unwrap();
+        });
+        // Read nothing while the path saturates...
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // ...then drain slowly, 8 KB at a time.
+        let mut received = Vec::with_capacity(payload.len());
+        let mut buf = vec![0u8; 8192];
+        let drain = async {
+            while received.len() < payload.len() {
+                match rd.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!("slow read failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(90), drain)
+            .await
+            .expect("slow-consumer drain timed out");
+        writer.await.unwrap();
+        assert_bytes_exact(&received, &payload);
+    }
+
+    /// Four streams in parallel over the chaos transport, each with
+    /// its own byte pattern: no cross-talk, no loss.
+    #[tokio::test]
+    async fn gateway_simultaneous_streams_over_chaos() {
+        let (echo_port, _accepted) = echo_server().await;
+        let allow = vec![rule("svc", "edge", "echo", echo_port, "ALLOW")];
+        let (a, b) =
+            linked_pair_chaos(allow.clone(), allow, 6461, "100.64.33.1", "100.64.33.2").await;
+        let gw_b = Gateway::new(b.clone(), "node".to_string());
+        gw_b.spawn_event_loop(b.take_stream_receiver().unwrap());
+        let gw_a = Gateway::new(a.clone(), "edge".to_string());
+        gw_a.spawn_event_loop(a.take_stream_receiver().unwrap());
+        gw_a.spawn_forward(ServiceForward {
+            name: "echo".to_string(),
+            listen: "127.0.0.1:18716".to_string(),
+            target_vip: "100.64.33.2".to_string(),
+            target_port: echo_port,
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut tasks = Vec::new();
+        for k in 0..4u8 {
+            tasks.push(tokio::spawn(async move {
+                let payload = pattern(48_000, 20 + k);
+                let client = TcpStream::connect("127.0.0.1:18716").await.unwrap();
+                let (mut rd, mut wr) = client.into_split();
+                let send_payload = payload.clone();
+                let writer = tokio::spawn(async move {
+                    wr.write_all(&send_payload).await.unwrap();
+                });
+                let mut received = vec![0u8; payload.len()];
+                tokio::time::timeout(Duration::from_secs(60), rd.read_exact(&mut received))
+                    .await
+                    .expect("parallel stream timed out")
+                    .expect("parallel stream read failed");
+                writer.await.unwrap();
+                assert_bytes_exact(&received, &payload);
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+    }
+
+    /// A client that vanishes mid-transfer must not wedge the
+    /// gateway: a fresh connection right after echoes normally.
+    #[tokio::test]
+    async fn gateway_disconnect_mid_transfer_keeps_gateway_healthy() {
+        let (echo_port, _accepted) = echo_server().await;
+        let allow = vec![rule("svc", "edge", "echo", echo_port, "ALLOW")];
+        let (a, b) =
+            linked_pair_chaos(allow.clone(), allow, 6471, "100.64.34.1", "100.64.34.2").await;
+        let gw_b = Gateway::new(b.clone(), "node".to_string());
+        gw_b.spawn_event_loop(b.take_stream_receiver().unwrap());
+        let gw_a = Gateway::new(a.clone(), "edge".to_string());
+        gw_a.spawn_event_loop(a.take_stream_receiver().unwrap());
+        gw_a.spawn_forward(ServiceForward {
+            name: "echo".to_string(),
+            listen: "127.0.0.1:18717".to_string(),
+            target_vip: "100.64.34.2".to_string(),
+            target_port: echo_port,
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Client 1: blast 96 KB and disappear without reading.
+        {
+            let mut c1 = TcpStream::connect("127.0.0.1:18717").await.unwrap();
+            let _ = c1.write_all(&pattern(96_000, 31)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // Client 2: the gateway must still serve a clean echo.
+        let mut c2 = TcpStream::connect("127.0.0.1:18717").await.unwrap();
+        c2.write_all(b"still alive").await.unwrap();
+        let mut buf = [0u8; 11];
+        tokio::time::timeout(Duration::from_secs(15), c2.read_exact(&mut buf))
+            .await
+            .expect("post-disconnect echo timed out")
+            .expect("post-disconnect echo failed");
+        assert_eq!(&buf, b"still alive");
     }
 }

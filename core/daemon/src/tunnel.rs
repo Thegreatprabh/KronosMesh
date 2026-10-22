@@ -44,6 +44,28 @@ pub const KIND_DATA: u8 = 0x03;
 pub const KIND_STREAM_OPEN: u8 = 0x04;
 pub const KIND_STREAM_DATA: u8 = 0x05;
 pub const KIND_STREAM_CLOSE: u8 = 0x06;
+pub const KIND_STREAM_ACK: u8 = 0x07;
+pub const KIND_STREAM_RESET: u8 = 0x08;
+
+/// Reliable-stream parameters. Service streams carry TCP connections,
+/// so the stream layer implements the reliability TCP assumes:
+/// per-direction sequence numbers, cumulative acknowledgements, a
+/// bounded sender window (backpressure), and retransmission on a
+/// fixed RTO until acknowledged. See `OutStream` / `InStream`.
+/// Maximum unacknowledged DATA frames per stream direction.
+pub const STREAM_WINDOW: usize = 32;
+/// Maximum payload bytes per stream DATA frame.
+pub const STREAM_FRAME_PAYLOAD: usize = 4096;
+/// Retransmission timeout for unacknowledged stream frames.
+const STREAM_RTO: Duration = Duration::from_millis(200);
+/// Housekeeping cadence for stream retransmission and state purges.
+const STREAM_TICK: Duration = Duration::from_millis(50);
+/// Ordered frames buffered for the gateway consumer per stream. When
+/// it fills, the receiver stops advancing its ACK — that is what
+/// propagates a slow consumer's backpressure to the sender.
+pub const STREAM_DELIVERY_CAP: usize = 32;
+/// How long finished stream state lingers to answer retransmissions.
+const STREAM_LINGER: Duration = Duration::from_secs(15);
 
 const HANDSHAKE_WAIT: Duration = Duration::from_millis(3000);
 /// Hop limit stamped on inner packets; relays decrement it and drop at
@@ -136,13 +158,19 @@ pub struct MemoryHub {
 
 impl MemoryHub {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { nodes: std::sync::Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            nodes: std::sync::Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn register(self: &Arc<Self>, addr: SocketAddr) -> MemoryTransport {
         let (tx, rx) = mpsc::channel(4096);
         self.nodes.lock().unwrap().insert(addr, tx);
-        MemoryTransport { hub: self.clone(), addr, inbox: tokio::sync::Mutex::new(rx) }
+        MemoryTransport {
+            hub: self.clone(),
+            addr,
+            inbox: tokio::sync::Mutex::new(rx),
+        }
     }
 }
 
@@ -190,6 +218,129 @@ impl Transport for MemoryTransport {
                 None => Err(std::io::Error::other("hub closed")),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chaos transport (tests only): wraps a MemoryTransport and subjects
+// datagrams to seeded, deterministic loss, duplication and
+// reordering — the failure modes of a real UDP path — so stream
+// reliability is proven against them instead of against a perfect
+// switchboard. A background flusher releases held (reordered)
+// datagrams in random order on a short cadence.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub struct ChaosTransport {
+    inner: Arc<MemoryTransport>,
+    state: Arc<std::sync::Mutex<ChaosState>>,
+}
+
+#[cfg(test)]
+struct ChaosState {
+    rng: u64,
+    drop_pct: u32,
+    dup_pct: u32,
+    hold_pct: u32,
+    held: Vec<(Vec<u8>, SocketAddr)>,
+}
+
+#[cfg(test)]
+fn xorshift(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+#[cfg(test)]
+impl ChaosTransport {
+    pub fn wrap(inner: MemoryTransport, seed: u64, drop_pct: u32, dup_pct: u32) -> Self {
+        let inner = Arc::new(inner);
+        let state = Arc::new(std::sync::Mutex::new(ChaosState {
+            rng: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            drop_pct,
+            dup_pct,
+            hold_pct: 20,
+            held: Vec::new(),
+        }));
+        let flush_inner = inner.clone();
+        let flush_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let batch: Vec<(Vec<u8>, SocketAddr)> = {
+                    let mut st = flush_state.lock().unwrap();
+                    let mut out = Vec::new();
+                    while !st.held.is_empty() {
+                        let idx = (xorshift(&mut st.rng) as usize) % st.held.len();
+                        out.push(st.held.swap_remove(idx));
+                    }
+                    out
+                };
+                for (frame, addr) in batch {
+                    let _ = flush_inner.send_to(&frame, addr).await;
+                }
+            }
+        });
+        Self { inner, state }
+    }
+}
+
+#[cfg(test)]
+impl Transport for ChaosTransport {
+    fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr()
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        addr: SocketAddr,
+    ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send + 'a {
+        async move {
+            enum Act {
+                Drop,
+                Send,
+                Dup,
+                Hold,
+            }
+            let act = {
+                let mut st = self.state.lock().unwrap();
+                let roll = xorshift(&mut st.rng) % 100;
+                if roll < st.drop_pct as u64 {
+                    Act::Drop
+                } else if roll < (st.drop_pct + st.dup_pct) as u64 {
+                    Act::Dup
+                } else if roll < (st.drop_pct + st.dup_pct + st.hold_pct) as u64 {
+                    st.held.push((buf.to_vec(), addr));
+                    Act::Hold
+                } else {
+                    Act::Send
+                }
+            };
+            match act {
+                Act::Drop => Ok(buf.len()),
+                Act::Send => self.inner.send_to(buf, addr).await,
+                Act::Dup => {
+                    let _ = self.inner.send_to(buf, addr).await;
+                    self.state.lock().unwrap().held.push((buf.to_vec(), addr));
+                    Ok(buf.len())
+                }
+                Act::Hold => Ok(buf.len()),
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl std::future::Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a {
+        self.inner.recv_from(buf)
     }
 }
 
@@ -258,12 +409,7 @@ pub enum AclDecision {
 /// review this is the only place these semantics live: before, the
 /// data path evaluated a wildcard-only subset and service-specific
 /// rules were decided nowhere.
-pub fn acl_decision(
-    rules: &[AclRule],
-    source_role: &str,
-    service: &str,
-    port: u16,
-) -> AclDecision {
+pub fn acl_decision(rules: &[AclRule], source_role: &str, service: &str, port: u16) -> AclDecision {
     let mut best_deny: Option<&AclRule> = None;
     let mut allowed = false;
     for rule in rules {
@@ -291,10 +437,13 @@ pub fn acl_decision(
     }
 }
 
-/// A service-stream event delivered to the gateway. The sender's vip
-/// and role are resolved from the authenticated session and the peer
-/// table exactly like the data path — a relaying peer cannot launder
-/// the origin's identity.
+/// A service-stream event delivered to the gateway. Only OPEN is an
+/// event: stream DATA is pulled in order through
+/// [`Tunnel::next_stream_data`] (which is what makes ordered,
+/// loss-free delivery natural to consume), and end-of-stream is that
+/// call returning `None`. The sender's vip and role are resolved from
+/// the authenticated session and the peer table exactly like the data
+/// path — a relaying peer cannot launder the origin's identity.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Open {
@@ -304,15 +453,125 @@ pub enum StreamEvent {
         service: String,
         port: u16,
     },
-    Data {
-        src_vip: String,
-        stream_id: u32,
-        data: Vec<u8>,
-    },
-    Close {
-        src_vip: String,
-        stream_id: u32,
-    },
+}
+
+/// Sender-side state for one stream direction (us -> peer).
+struct OutStream {
+    state: Mutex<OutStreamState>,
+    /// Signalled when an ACK advances the window or the stream dies.
+    notify: tokio::sync::Notify,
+}
+
+struct OutStreamState {
+    /// Next sequence number to assign.
+    next_seq: u32,
+    /// Frames sent but not yet cumulatively acknowledged, kept for
+    /// retransmission: seq -> (last sent, full frame body).
+    unacked: std::collections::BTreeMap<u32, (Instant, Vec<u8>)>,
+    open_body: Vec<u8>,
+    open_last_sent: Instant,
+    open_acked: bool,
+    /// Set when close was requested: the final sequence number (one
+    /// past the last DATA frame) the peer must reach.
+    close_final: Option<u32>,
+    close_last_sent: Option<Instant>,
+    close_acked: bool,
+    /// A RESET arrived (or the stream was abandoned locally): sends
+    /// fail and retransmission stops.
+    dead: bool,
+    last_activity: Instant,
+}
+
+impl OutStream {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OutStreamState {
+                next_seq: 0,
+                unacked: std::collections::BTreeMap::new(),
+                open_body: Vec::new(),
+                open_last_sent: Instant::now(),
+                open_acked: false,
+                close_final: None,
+                close_last_sent: None,
+                close_acked: false,
+                dead: false,
+                last_activity: Instant::now(),
+            }),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+/// Receiver-side state for one stream direction (peer -> us).
+struct InStream {
+    state: Mutex<InStreamState>,
+    /// Signalled when ordered data or end-of-stream becomes
+    /// available for `next_stream_data`.
+    notify: tokio::sync::Notify,
+}
+
+struct InStreamState {
+    /// Next sequence number to release to the consumer; also the
+    /// cumulative acknowledgement we advertise.
+    next_expected: u32,
+    /// Out-of-order frames waiting for their predecessors.
+    buffered: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// In-order payloads ready for the consumer (bounded: see
+    /// STREAM_DELIVERY_CAP).
+    delivery: std::collections::VecDeque<Vec<u8>>,
+    /// The sender's final sequence number, once its CLOSE arrives.
+    close_at: Option<u32>,
+    open_seen: bool,
+    open_emitted: bool,
+    /// End-of-stream was reached and reported.
+    finished: bool,
+    /// A RESET arrived: the consumer sees end-of-stream and buffered
+    /// data is discarded (the stream was refused or aborted).
+    dead: bool,
+    last_activity: Instant,
+}
+
+impl InStream {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InStreamState {
+                next_expected: 0,
+                buffered: std::collections::BTreeMap::new(),
+                delivery: std::collections::VecDeque::new(),
+                close_at: None,
+                open_seen: false,
+                open_emitted: false,
+                finished: false,
+                dead: false,
+                last_activity: Instant::now(),
+            }),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// True when the CLOSE is fully satisfied: every frame up to the
+    /// final sequence number has been released to the delivery
+    /// queue. This is the flag ACKs advertise as "close complete".
+    fn close_complete(st: &InStreamState) -> bool {
+        match st.close_at {
+            Some(final_seq) => st.next_expected >= final_seq && st.buffered.is_empty(),
+            None => false,
+        }
+    }
+
+    /// Moves consecutive buffered frames into the delivery queue,
+    /// stopping at the delivery cap (backpressure) or a gap.
+    fn drain(st: &mut InStreamState) {
+        while st.delivery.len() < STREAM_DELIVERY_CAP {
+            match st.buffered.remove(&st.next_expected) {
+                Some(payload) => {
+                    st.delivery.push_back(payload);
+                    st.next_expected += 1;
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 pub struct Tunnel<T: Transport> {
@@ -339,6 +598,16 @@ pub struct Tunnel<T: Transport> {
     app_tx: mpsc::Sender<(String, Vec<u8>)>,
     stream_tx: mpsc::Sender<StreamEvent>,
     stream_rx: Mutex<Option<mpsc::Receiver<StreamEvent>>>,
+    /// Reliable-stream state, keyed by (peer vip, stream id); the
+    /// two maps are the two independent directions of a stream.
+    out_streams: Mutex<HashMap<(String, u32), Arc<OutStream>>>,
+    in_streams: Mutex<HashMap<(String, u32), Arc<InStream>>>,
+    /// Recently reset (peer, stream id) pairs. A RESET can race
+    /// ahead of the gateway registering its interest in the stream;
+    /// the tombstone makes a stream state created just after the
+    /// reset still come up dead instead of hanging forever. Entries
+    /// expire (see housekeeping), after which the id may be reused.
+    stream_tombstones: Mutex<HashMap<(String, u32), Instant>>,
     started: Instant,
 }
 
@@ -377,7 +646,6 @@ impl Tunnel<UdpTransport> {
             ring,
         )
     }
-
 }
 
 impl<T: Transport> Tunnel<T> {
@@ -389,8 +657,8 @@ impl<T: Transport> Tunnel<T> {
         telemetry: Arc<TelemetryCounters>,
         ring: Arc<EventRing>,
     ) -> Result<(Arc<Self>, AppRx)> {
-        let octets = vip_to_octets(local_vip)
-            .ok_or_else(|| anyhow!("invalid virtual ip {local_vip}"))?;
+        let octets =
+            vip_to_octets(local_vip).ok_or_else(|| anyhow!("invalid virtual ip {local_vip}"))?;
         let (app_tx, app_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(256);
         let tunnel = Arc::new(Self {
@@ -413,6 +681,9 @@ impl<T: Transport> Tunnel<T> {
             app_tx,
             stream_tx,
             stream_rx: Mutex::new(Some(stream_rx)),
+            out_streams: Mutex::new(HashMap::new()),
+            in_streams: Mutex::new(HashMap::new()),
+            stream_tombstones: Mutex::new(HashMap::new()),
             started: Instant::now(),
         });
         Ok((tunnel, app_rx))
@@ -496,13 +767,7 @@ impl<T: Transport> Tunnel<T> {
 
     // -- peer table -----------------------------------------------------------
 
-    pub fn add_peer(
-        &self,
-        public_hex: &str,
-        vip: &str,
-        endpoint: Option<SocketAddr>,
-        role: &str,
-    ) {
+    pub fn add_peer(&self, public_hex: &str, vip: &str, endpoint: Option<SocketAddr>, role: &str) {
         let key_bytes = match hex_decode(public_hex) {
             Ok(b) if b.len() == 32 => b,
             _ => return,
@@ -547,7 +812,8 @@ impl<T: Transport> Tunnel<T> {
             .unwrap()
             .insert(octets, public_hex.to_string());
         if is_new {
-            self.ring.push(format!("peer added: {} ({})", public_hex, vip));
+            self.ring
+                .push(format!("peer added: {} ({})", public_hex, vip));
         }
     }
 
@@ -571,8 +837,7 @@ impl<T: Transport> Tunnel<T> {
     /// Public keys of peers with established encrypted sessions; the
     /// control plane renders topology links from these reports.
     pub fn established_peer_keys(&self) -> Vec<String> {
-        let peers: Vec<Arc<Peer>> =
-            self.peers.lock().unwrap().values().cloned().collect();
+        let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
         peers
             .iter()
             .filter(|p| matches!(*p.state.lock().unwrap(), PeerState::Established { .. }))
@@ -581,8 +846,7 @@ impl<T: Transport> Tunnel<T> {
     }
 
     pub fn connected_peer_count(&self) -> u32 {
-        let peers: Vec<Arc<Peer>> =
-            self.peers.lock().unwrap().values().cloned().collect();
+        let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
         peers
             .iter()
             .filter(|p| matches!(*p.state.lock().unwrap(), PeerState::Established { .. }))
@@ -590,8 +854,7 @@ impl<T: Transport> Tunnel<T> {
     }
 
     pub fn avg_latency_ms(&self) -> f64 {
-        let peers: Vec<Arc<Peer>> =
-            self.peers.lock().unwrap().values().cloned().collect();
+        let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
         let vals: Vec<f64> = peers
             .iter()
             .map(|p| *p.latency_ms.lock().unwrap())
@@ -657,8 +920,12 @@ impl<T: Transport> Tunnel<T> {
         match self.transport.send_to(frame, endpoint).await {
             Ok(n) => {
                 self.telemetry.packets_out.fetch_add(1, Ordering::Relaxed);
-                self.telemetry.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
-                self.telemetry.userspace_packets.fetch_add(1, Ordering::Relaxed);
+                self.telemetry
+                    .bytes_out
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                self.telemetry
+                    .userspace_packets
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -669,8 +936,7 @@ impl<T: Transport> Tunnel<T> {
 
     async fn initiate_handshake(&self, peer: &Arc<Peer>) -> Result<()> {
         let local_index = self.next_index();
-        let mut initiator =
-            HandshakeInitiator::new(self.identity.secret(), peer.public);
+        let mut initiator = HandshakeInitiator::new(self.identity.secret(), peer.public);
         let init_ts = self.next_init_ts();
         let msg1 = initiator.write_message1(&init_ts.to_le_bytes())?;
         self.by_index
@@ -736,12 +1002,15 @@ impl<T: Transport> Tunnel<T> {
         let needs_init = {
             let mut state = peer.state.lock().unwrap();
             match &mut *state {
-                PeerState::Established { session, since, local_index, .. } => {
+                PeerState::Established {
+                    session,
+                    since,
+                    local_index,
+                    ..
+                } => {
                     if session.initiator
                         && since.elapsed()
-                            > Duration::from_secs(
-                                self.rekey_after_secs.load(Ordering::Relaxed),
-                            )
+                            > Duration::from_secs(self.rekey_after_secs.load(Ordering::Relaxed))
                     {
                         // Rekey: retire the old session index and fall
                         // through to a fresh handshake with new keys.
@@ -840,7 +1109,11 @@ impl<T: Transport> Tunnel<T> {
         let (counter, remote_index, ciphertext) = {
             let mut state = peer.state.lock().unwrap();
             match &mut *state {
-                PeerState::Established { session, remote_index, .. } => {
+                PeerState::Established {
+                    session,
+                    remote_index,
+                    ..
+                } => {
                     let (c, ct) = session.seal(&inner)?;
                     (c, *remote_index, ct)
                 }
@@ -865,8 +1138,8 @@ impl<T: Transport> Tunnel<T> {
     }
 
     pub async fn send_data(&self, dst_vip: &str, payload: &[u8]) -> Result<()> {
-        let octets = vip_to_octets(dst_vip)
-            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        let octets =
+            vip_to_octets(dst_vip).ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
         self.send_inner(octets, KIND_DATA, payload).await
     }
 
@@ -876,17 +1149,85 @@ impl<T: Transport> Tunnel<T> {
         self.acl_rules.lock().unwrap().clone()
     }
 
-    /// Takes the service-stream event receiver (once). The gateway
-    /// consumes it; without a consumer, stream events land in a
-    /// bounded channel and are dropped rather than buffered forever.
+    /// Takes the service-stream OPEN event receiver (once). The
+    /// gateway consumes it; stream data itself is pulled in order
+    /// through `next_stream_data`.
     pub fn take_stream_receiver(&self) -> Option<mpsc::Receiver<StreamEvent>> {
         self.stream_rx.lock().unwrap().take()
     }
 
-    /// Opens a service stream at a peer's gateway. Policy is the
-    /// caller's job on this side (the initiating gateway checks) and
-    /// the receiver's job on its side (its gateway checks again); the
-    /// tunnel only transports.
+    fn tombstoned(&self, peer_vip: &str, stream_id: u32) -> bool {
+        self.stream_tombstones
+            .lock()
+            .unwrap()
+            .get(&(peer_vip.to_string(), stream_id))
+            .map(|t| t.elapsed() < STREAM_LINGER * 4)
+            .unwrap_or(false)
+    }
+
+    fn out_stream(&self, dst_vip: &str, stream_id: u32) -> Arc<OutStream> {
+        let dead = self.tombstoned(dst_vip, stream_id);
+        self.out_streams
+            .lock()
+            .unwrap()
+            .entry((dst_vip.to_string(), stream_id))
+            .or_insert_with(|| {
+                let stream = OutStream::new();
+                if dead {
+                    stream.state.lock().unwrap().dead = true;
+                }
+                Arc::new(stream)
+            })
+            .clone()
+    }
+
+    fn in_stream(&self, src_vip: &str, stream_id: u32) -> Arc<InStream> {
+        let dead = self.tombstoned(src_vip, stream_id);
+        self.in_streams
+            .lock()
+            .unwrap()
+            .entry((src_vip.to_string(), stream_id))
+            .or_insert_with(|| {
+                let stream = InStream::new();
+                if dead {
+                    stream.state.lock().unwrap().dead = true;
+                }
+                Arc::new(stream)
+            })
+            .clone()
+    }
+
+    /// Applies a reset (ours or the peer's): tombstone the id so
+    /// late state creation still comes up dead, then drop both
+    /// directions' state, waking every waiter.
+    fn apply_reset(&self, peer_vip: &str, stream_id: u32) {
+        self.stream_tombstones
+            .lock()
+            .unwrap()
+            .insert((peer_vip.to_string(), stream_id), Instant::now());
+        self.drop_stream_state(peer_vip, stream_id);
+    }
+
+    fn find_out_stream(&self, dst_vip: &str, stream_id: u32) -> Option<Arc<OutStream>> {
+        self.out_streams
+            .lock()
+            .unwrap()
+            .get(&(dst_vip.to_string(), stream_id))
+            .cloned()
+    }
+
+    fn find_in_stream(&self, src_vip: &str, stream_id: u32) -> Option<Arc<InStream>> {
+        self.in_streams
+            .lock()
+            .unwrap()
+            .get(&(src_vip.to_string(), stream_id))
+            .cloned()
+    }
+
+    /// Opens a service stream at a peer's gateway. The OPEN is
+    /// retransmitted by housekeeping until the peer acknowledges the
+    /// stream, so a lost OPEN cannot strand it. Policy is the
+    /// gateways' job on both ends; the tunnel only transports.
     pub async fn send_stream_open(
         &self,
         dst_vip: &str,
@@ -894,41 +1235,276 @@ impl<T: Transport> Tunnel<T> {
         service: &str,
         port: u16,
     ) -> Result<()> {
-        let octets = vip_to_octets(dst_vip)
-            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        let octets =
+            vip_to_octets(dst_vip).ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
         let mut body = Vec::with_capacity(6 + service.len());
         body.extend_from_slice(&stream_id.to_be_bytes());
         body.extend_from_slice(&port.to_be_bytes());
         body.extend_from_slice(service.as_bytes());
+        let stream = self.out_stream(dst_vip, stream_id);
+        {
+            let mut st = stream.state.lock().unwrap();
+            st.open_body = body.clone();
+            st.open_last_sent = Instant::now();
+            st.last_activity = Instant::now();
+        }
         self.send_inner(octets, KIND_STREAM_OPEN, &body).await
     }
 
-    pub async fn send_stream_data(
+    /// Sends data on a stream, reliably and in order. The payload is
+    /// chunked into sequenced frames; when STREAM_WINDOW frames are
+    /// unacknowledged this call WAITS — that wait is the backpressure
+    /// path. A fast local sender is throttled by the peer's actual
+    /// consumption, and no byte is ever discarded to make progress:
+    /// unacknowledged frames are retransmitted until the peer's
+    /// cumulative ACK passes them.
+    pub async fn send_stream_data(&self, dst_vip: &str, stream_id: u32, data: &[u8]) -> Result<()> {
+        let octets =
+            vip_to_octets(dst_vip).ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        let stream = self.out_stream(dst_vip, stream_id);
+        for chunk in data.chunks(STREAM_FRAME_PAYLOAD) {
+            let body = loop {
+                let notified = stream.notify.notified();
+                tokio::pin!(notified);
+                // Register for wakeup BEFORE checking state, so an
+                // ACK landing between the check and the await cannot
+                // be missed.
+                let _ = notified.as_mut().enable();
+                let candidate = {
+                    let mut st = stream.state.lock().unwrap();
+                    if st.dead {
+                        return Err(anyhow!("stream {stream_id} to {dst_vip} was reset"));
+                    }
+                    if st.close_final.is_some() {
+                        return Err(anyhow!("stream {stream_id} is closing"));
+                    }
+                    if st.unacked.len() < STREAM_WINDOW {
+                        let seq = st.next_seq;
+                        st.next_seq += 1;
+                        let mut body = Vec::with_capacity(8 + chunk.len());
+                        body.extend_from_slice(&stream_id.to_be_bytes());
+                        body.extend_from_slice(&seq.to_be_bytes());
+                        body.extend_from_slice(chunk);
+                        st.unacked.insert(seq, (Instant::now(), body.clone()));
+                        st.last_activity = Instant::now();
+                        Some(body)
+                    } else {
+                        None
+                    }
+                };
+                match candidate {
+                    Some(body) => break body,
+                    None => notified.await,
+                }
+            };
+            if let Err(e) = self.send_inner(octets, KIND_STREAM_DATA, &body).await {
+                // A hard send error (no route, session lost): pull
+                // the frame back out of the retransmission set and
+                // fail visibly instead of buffering it forever.
+                let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                stream.state.lock().unwrap().unacked.remove(&seq);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes our sending direction of a stream. The CLOSE carries
+    /// the final sequence number and is retransmitted by
+    /// housekeeping until the peer acknowledges it complete, so the
+    /// peer delivers every queued byte before reporting
+    /// end-of-stream. Returns after the first send; completion is
+    /// asynchronous (`stream_close_acked` exposes it).
+    pub async fn send_stream_close(&self, dst_vip: &str, stream_id: u32) -> Result<()> {
+        let octets =
+            vip_to_octets(dst_vip).ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
+        let stream = self.out_stream(dst_vip, stream_id);
+        let body = {
+            let mut st = stream.state.lock().unwrap();
+            let next = st.next_seq;
+            let final_seq = *st.close_final.get_or_insert(next);
+            st.close_last_sent = Some(Instant::now());
+            st.last_activity = Instant::now();
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&stream_id.to_be_bytes());
+            body.extend_from_slice(&final_seq.to_be_bytes());
+            body
+        };
+        self.send_inner(octets, KIND_STREAM_CLOSE, &body).await
+    }
+
+    /// Test/diagnostic snapshot of stream state for (peer, id).
+    #[cfg(test)]
+    pub fn stream_debug(&self, peer_vip: &str, stream_id: u32) -> String {
+        let out = self
+            .find_out_stream(peer_vip, stream_id)
+            .map(|s| {
+                let st = s.state.lock().unwrap();
+                format!(
+                    "OUT next_seq={} unacked={} open_acked={} close={:?} close_acked={} dead={}",
+                    st.next_seq,
+                    st.unacked.len(),
+                    st.open_acked,
+                    st.close_final,
+                    st.close_acked,
+                    st.dead
+                )
+            })
+            .unwrap_or_else(|| "OUT none".to_string());
+        let inp = self
+            .find_in_stream(peer_vip, stream_id)
+            .map(|s| {
+                let st = s.state.lock().unwrap();
+                format!(
+                    "IN next_exp={} buffered={} delivery={} close_at={:?} open_seen={} open_emitted={} finished={} dead={}",
+                    st.next_expected,
+                    st.buffered.len(),
+                    st.delivery.len(),
+                    st.close_at,
+                    st.open_seen,
+                    st.open_emitted,
+                    st.finished,
+                    st.dead
+                )
+            })
+            .unwrap_or_else(|| "IN none".to_string());
+        format!("{out} | {inp}")
+    }
+
+    /// Whether the peer has acknowledged our CLOSE as fully
+    /// delivered (diagnostics and tests).
+    pub fn stream_close_acked(&self, dst_vip: &str, stream_id: u32) -> bool {
+        self.find_out_stream(dst_vip, stream_id)
+            .map(|s| s.state.lock().unwrap().close_acked)
+            .unwrap_or(false)
+    }
+
+    /// Whether the inbound direction of a stream ended by RESET
+    /// (refusal/abort) rather than an orderly close. The gateway
+    /// uses this to decide whether the sibling pump must be stopped
+    /// immediately or allowed to drain (half-close semantics).
+    pub fn stream_was_reset(&self, peer_vip: &str, stream_id: u32) -> bool {
+        self.find_in_stream(peer_vip, stream_id)
+            .map(|s| s.state.lock().unwrap().dead)
+            .unwrap_or(false)
+    }
+
+    /// Aborts a stream in both directions and tells the peer to do
+    /// the same (RESET). Used for refusals and hard teardown:
+    /// buffered data for the stream is discarded on both sides.
+    pub async fn reset_stream(&self, peer_vip: &str, stream_id: u32) {
+        self.apply_reset(peer_vip, stream_id);
+        if let Some(octets) = vip_to_octets(peer_vip) {
+            let _ = self
+                .send_inner(octets, KIND_STREAM_RESET, &stream_id.to_be_bytes())
+                .await;
+        }
+    }
+
+    /// Drops local stream state for (peer, id) in both directions
+    /// without notifying the peer; waiters wake and senders fail.
+    pub fn drop_stream_state(&self, peer_vip: &str, stream_id: u32) {
+        let key = (peer_vip.to_string(), stream_id);
+        if let Some(s) = self.out_streams.lock().unwrap().remove(&key) {
+            s.state.lock().unwrap().dead = true;
+            s.notify.notify_waiters();
+        }
+        if let Some(s) = self.in_streams.lock().unwrap().remove(&key) {
+            s.state.lock().unwrap().dead = true;
+            s.notify.notify_waiters();
+        }
+    }
+
+    /// Drops only the inbound (peer -> us) state for a stream; the
+    /// outbound direction is left to its close/retransmission
+    /// lifecycle.
+    pub fn drop_in_stream(&self, peer_vip: &str, stream_id: u32) {
+        let key = (peer_vip.to_string(), stream_id);
+        if let Some(s) = self.in_streams.lock().unwrap().remove(&key) {
+            s.state.lock().unwrap().dead = true;
+            s.notify.notify_waiters();
+        }
+    }
+
+    /// Pulls the next in-order payload for a stream from `src_vip`.
+    /// Returns `None` at end-of-stream: the peer's CLOSE arrived and
+    /// every preceding byte was delivered, or the stream was reset.
+    /// This is the ONLY way stream data leaves the tunnel, so order
+    /// and completeness are structural. Consuming advances the
+    /// receive window and triggers a fresh ACK — the consumer's pace
+    /// is the sender's pace.
+    pub async fn next_stream_data(&self, src_vip: &str, stream_id: u32) -> Option<Vec<u8>> {
+        enum Pull {
+            Data(Vec<u8>),
+            End,
+            Wait,
+        }
+        let stream = self.in_stream(src_vip, stream_id);
+        loop {
+            let notified = stream.notify.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            let mut ack: Option<(u32, bool)> = None;
+            let step = {
+                let mut st = stream.state.lock().unwrap();
+                if st.dead {
+                    Pull::End
+                } else if let Some(front) = st.delivery.pop_front() {
+                    let before = st.next_expected;
+                    InStream::drain(&mut st);
+                    if st.next_expected != before {
+                        ack = Some((st.next_expected, InStream::close_complete(&st)));
+                    }
+                    Pull::Data(front)
+                } else if InStream::close_complete(&st) {
+                    st.finished = true;
+                    Pull::End
+                } else {
+                    Pull::Wait
+                }
+            };
+            if let Some((next_expected, close_complete)) = ack {
+                self.send_stream_ack(src_vip, stream_id, next_expected, close_complete)
+                    .await;
+            }
+            match step {
+                Pull::Data(data) => return Some(data),
+                Pull::End => return None,
+                Pull::Wait => notified.await,
+            }
+        }
+    }
+
+    async fn send_stream_ack(
         &self,
         dst_vip: &str,
         stream_id: u32,
-        data: &[u8],
-    ) -> Result<()> {
-        let octets = vip_to_octets(dst_vip)
-            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
-        let mut body = Vec::with_capacity(4 + data.len());
-        body.extend_from_slice(&stream_id.to_be_bytes());
-        body.extend_from_slice(data);
-        self.send_inner(octets, KIND_STREAM_DATA, &body).await
+        next_expected: u32,
+        close_complete: bool,
+    ) {
+        if let Some(octets) = vip_to_octets(dst_vip) {
+            let mut body = Vec::with_capacity(9);
+            body.extend_from_slice(&stream_id.to_be_bytes());
+            body.extend_from_slice(&next_expected.to_be_bytes());
+            body.push(close_complete as u8);
+            let _ = self.send_inner(octets, KIND_STREAM_ACK, &body).await;
+        }
     }
 
-    pub async fn send_stream_close(&self, dst_vip: &str, stream_id: u32) -> Result<()> {
-        let octets = vip_to_octets(dst_vip)
-            .ok_or_else(|| anyhow!("invalid virtual ip {dst_vip}"))?;
-        self.send_inner(octets, KIND_STREAM_CLOSE, &stream_id.to_be_bytes())
-            .await
-    }
-
-    /// Parses a decrypted stream frame for this node and queues it
-    /// for the gateway. Malformed frames are dropped silently.
-    fn deliver_stream_event(&self, kind: u8, src_vip: &[u8; 4], src_role: String, body: &[u8]) {
+    /// Handles one decrypted stream frame addressed to this node.
+    /// Malformed frames are dropped silently. ACKs are sent from
+    /// here (and from `next_stream_data` when consumption advances
+    /// the window), never batched behind a timer, so the sender's
+    /// window tracks the receiver's true position.
+    async fn handle_stream_frame(
+        &self,
+        kind: u8,
+        src_vip: &[u8; 4],
+        src_role: String,
+        body: &[u8],
+    ) {
         let src = octets_to_vip(src_vip);
-        let event = match kind {
+        match kind {
             KIND_STREAM_OPEN => {
                 if body.len() < 6 {
                     return;
@@ -939,40 +1515,232 @@ impl<T: Transport> Tunnel<T> {
                 if service.is_empty() {
                     return;
                 }
-                StreamEvent::Open {
-                    src_vip: src,
-                    src_role,
-                    stream_id,
-                    service,
-                    port,
+                let stream = self.in_stream(&src, stream_id);
+                let needs_emit = {
+                    let mut st = stream.state.lock().unwrap();
+                    st.last_activity = Instant::now();
+                    st.open_seen = true;
+                    !st.open_emitted
+                };
+                if needs_emit {
+                    let event = StreamEvent::Open {
+                        src_vip: src.clone(),
+                        src_role,
+                        stream_id,
+                        service,
+                        port,
+                    };
+                    match self.stream_tx.try_send(event) {
+                        Ok(()) => {
+                            stream.state.lock().unwrap().open_emitted = true;
+                            self.send_stream_ack(&src, stream_id, 0, false).await;
+                        }
+                        Err(_) => {
+                            // The event queue is full: do NOT ack.
+                            // The sender retransmits the OPEN and the
+                            // event is retried — an OPEN is never lost
+                            // silently.
+                            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    // Duplicate OPEN (our ACK was lost): re-ack with
+                    // the current receive position.
+                    let (next_expected, close_complete) = {
+                        let st = stream.state.lock().unwrap();
+                        (st.next_expected, InStream::close_complete(&st))
+                    };
+                    self.send_stream_ack(&src, stream_id, next_expected, close_complete)
+                        .await;
                 }
             }
             KIND_STREAM_DATA => {
-                if body.len() < 4 {
+                if body.len() < 8 {
                     return;
                 }
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
-                StreamEvent::Data {
-                    src_vip: src,
-                    stream_id,
-                    data: body[4..].to_vec(),
-                }
+                let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                let stream = self.in_stream(&src, stream_id);
+                let (next_expected, close_complete) = {
+                    let mut st = stream.state.lock().unwrap();
+                    st.last_activity = Instant::now();
+                    if !st.dead {
+                        // Accept frames inside the receive horizon:
+                        // the reorder buffer plus the delivery queue.
+                        // Anything beyond it is dropped; the sender's
+                        // retransmission re-offers it once the ACK
+                        // has advanced.
+                        let horizon = st
+                            .next_expected
+                            .saturating_add((STREAM_WINDOW + STREAM_DELIVERY_CAP) as u32);
+                        if seq >= st.next_expected && seq < horizon {
+                            st.buffered.entry(seq).or_insert_with(|| body[8..].to_vec());
+                            InStream::drain(&mut st);
+                        }
+                    }
+                    (st.next_expected, InStream::close_complete(&st))
+                };
+                stream.notify.notify_waiters();
+                self.send_stream_ack(&src, stream_id, next_expected, close_complete)
+                    .await;
             }
             KIND_STREAM_CLOSE => {
+                if body.len() < 8 {
+                    return;
+                }
+                let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                let final_seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                match self.find_in_stream(&src, stream_id) {
+                    Some(stream) => {
+                        let (next_expected, close_complete) = {
+                            let mut st = stream.state.lock().unwrap();
+                            st.last_activity = Instant::now();
+                            let cur = st.close_at.unwrap_or(0);
+                            st.close_at = Some(cur.max(final_seq));
+                            (st.next_expected, InStream::close_complete(&st))
+                        };
+                        stream.notify.notify_waiters();
+                        self.send_stream_ack(&src, stream_id, next_expected, close_complete)
+                            .await;
+                    }
+                    None => {
+                        // No state: the stream never existed here, or
+                        // it finished and was already purged after a
+                        // full delivery. Either way the sender can
+                        // stop retransmitting its CLOSE.
+                        self.send_stream_ack(&src, stream_id, final_seq, true).await;
+                    }
+                }
+            }
+            KIND_STREAM_ACK => {
+                if body.len() < 9 {
+                    return;
+                }
+                let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                let next_expected = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                let close_complete = body[8] != 0;
+                if let Some(stream) = self.find_out_stream(&src, stream_id) {
+                    {
+                        let mut st = stream.state.lock().unwrap();
+                        st.last_activity = Instant::now();
+                        st.open_acked = true;
+                        st.unacked.retain(|seq, _| *seq >= next_expected);
+                        if close_complete && st.close_final.is_some() {
+                            st.close_acked = true;
+                        }
+                    }
+                    stream.notify.notify_waiters();
+                }
+            }
+            KIND_STREAM_RESET => {
                 if body.len() < 4 {
                     return;
                 }
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
-                StreamEvent::Close {
-                    src_vip: src,
-                    stream_id,
+                self.apply_reset(&src, stream_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Periodic stream maintenance: retransmit anything
+    /// unacknowledged past the RTO (OPEN until acked, DATA frames,
+    /// CLOSE until acked complete) and purge finished state.
+    async fn stream_housekeeping(&self) {
+        let outs: Vec<((String, u32), Arc<OutStream>)> = self
+            .out_streams
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for ((dst, stream_id), stream) in outs {
+            let (resend_open, frames, resend_close, purge) = {
+                let mut st = stream.state.lock().unwrap();
+                let now = Instant::now();
+                let mut frames = Vec::new();
+                if !st.dead {
+                    for (sent_at, body) in st.unacked.values_mut() {
+                        if now.duration_since(*sent_at) >= STREAM_RTO {
+                            *sent_at = now;
+                            frames.push(body.clone());
+                        }
+                    }
+                }
+                let resend_open = !st.dead
+                    && !st.open_acked
+                    && !st.open_body.is_empty()
+                    && now.duration_since(st.open_last_sent) >= STREAM_RTO;
+                if resend_open {
+                    st.open_last_sent = now;
+                }
+                let resend_close = !st.dead
+                    && st.close_final.is_some()
+                    && !st.close_acked
+                    && st
+                        .close_last_sent
+                        .map(|t| now.duration_since(t) >= STREAM_RTO)
+                        .unwrap_or(false);
+                if resend_close {
+                    st.close_last_sent = Some(now);
+                }
+                let purge = st.dead || (st.close_acked && st.unacked.is_empty());
+                let open_body = if resend_open {
+                    Some(st.open_body.clone())
+                } else {
+                    None
+                };
+                let close_body = if resend_close {
+                    let mut b = Vec::with_capacity(8);
+                    b.extend_from_slice(&stream_id.to_be_bytes());
+                    b.extend_from_slice(&st.close_final.unwrap().to_be_bytes());
+                    Some(b)
+                } else {
+                    None
+                };
+                (open_body, frames, close_body, purge)
+            };
+            if purge {
+                self.out_streams
+                    .lock()
+                    .unwrap()
+                    .remove(&(dst.clone(), stream_id));
+                continue;
+            }
+            if let Some(octets) = vip_to_octets(&dst) {
+                if let Some(body) = resend_open {
+                    let _ = self.send_inner(octets, KIND_STREAM_OPEN, &body).await;
+                }
+                for body in frames {
+                    let _ = self.send_inner(octets, KIND_STREAM_DATA, &body).await;
+                }
+                if let Some(body) = resend_close {
+                    let _ = self.send_inner(octets, KIND_STREAM_CLOSE, &body).await;
                 }
             }
-            _ => return,
-        };
-        if self.stream_tx.try_send(event).is_err() {
-            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
         }
+        let ins: Vec<((String, u32), Arc<InStream>)> = self
+            .in_streams
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for ((src, stream_id), stream) in ins {
+            let purge = {
+                let st = stream.state.lock().unwrap();
+                let idle = Instant::now().duration_since(st.last_activity);
+                ((st.finished || st.dead) && idle > STREAM_LINGER)
+                    || (!st.open_seen && idle > STREAM_LINGER)
+            };
+            if purge {
+                self.in_streams.lock().unwrap().remove(&(src, stream_id));
+            }
+        }
+        self.stream_tombstones
+            .lock()
+            .unwrap()
+            .retain(|_, t| t.elapsed() < STREAM_LINGER * 4);
     }
 
     // -- receiving ---------------------------------------------------------------
@@ -1008,30 +1776,20 @@ impl<T: Transport> Tunnel<T> {
                         //    handlers; overload drops the datagram
                         //    (counted) instead of queueing forever.
                         if n < 8 || !matches!(buf[0], MSG_INIT | MSG_RESP | MSG_DATA) {
-                            recv_self
-                                .telemetry
-                                .drops
-                                .fetch_add(1, Ordering::Relaxed);
+                            recv_self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         if buf[0] == MSG_INIT && !recv_self.init_rate_ok(from) {
-                            recv_self
-                                .telemetry
-                                .drops
-                                .fetch_add(1, Ordering::Relaxed);
+                            recv_self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let permit =
-                            match recv_self.frame_permits.clone().try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    recv_self
-                                        .telemetry
-                                        .drops
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                            };
+                        let permit = match recv_self.frame_permits.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                recv_self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
                         // Each frame is handled in its own task: a
                         // handler may need to complete a handshake with
                         // a third node (mesh relay), which requires this
@@ -1056,6 +1814,14 @@ impl<T: Transport> Tunnel<T> {
                 ka_self.keepalive_tick().await;
             }
         });
+        let stream_self = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(STREAM_TICK);
+            loop {
+                tick.tick().await;
+                stream_self.stream_housekeeping().await;
+            }
+        });
         let ping_self = self.clone();
         tokio::spawn(async move {
             loop {
@@ -1069,11 +1835,12 @@ impl<T: Transport> Tunnel<T> {
         let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
         for peer in peers {
             let idle = peer.last_activity.lock().unwrap().elapsed();
-            let established =
-                matches!(*peer.state.lock().unwrap(), PeerState::Established { .. });
+            let established = matches!(*peer.state.lock().unwrap(), PeerState::Established { .. });
             if established && idle > KEEPALIVE_EVERY {
                 let vip = peer.vip;
-                let _ = self.send_inner(vip, KIND_PING, &now_millis().to_le_bytes()).await;
+                let _ = self
+                    .send_inner(vip, KIND_PING, &now_millis().to_le_bytes())
+                    .await;
             }
         }
     }
@@ -1081,11 +1848,12 @@ impl<T: Transport> Tunnel<T> {
     async fn ping_tick(&self) {
         let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
         for peer in peers {
-            let established =
-                matches!(*peer.state.lock().unwrap(), PeerState::Established { .. });
+            let established = matches!(*peer.state.lock().unwrap(), PeerState::Established { .. });
             if established {
                 let vip = peer.vip;
-                let _ = self.send_inner(vip, KIND_PING, &now_millis().to_le_bytes()).await;
+                let _ = self
+                    .send_inner(vip, KIND_PING, &now_millis().to_le_bytes())
+                    .await;
             } else if peer.endpoint.lock().unwrap().is_some() {
                 // Proactively build the mesh: a node in `up` mode
                 // establishes sessions with every known peer instead of
@@ -1145,7 +1913,8 @@ impl<T: Transport> Tunnel<T> {
             Ok(v) => v,
             Err(e) => {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
-                self.ring.push(format!("bad handshake init from {from}: {e}"));
+                self.ring
+                    .push(format!("bad handshake init from {from}: {e}"));
                 return;
             }
         };
@@ -1168,7 +1937,8 @@ impl<T: Transport> Tunnel<T> {
         // longer replace the live session or hijack the peer's endpoint.
         if payload.len() != 8 {
             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
-            self.ring.push("handshake init without timestamp payload".to_string());
+            self.ring
+                .push("handshake init without timestamp payload".to_string());
             return;
         }
         let init_ts = u64::from_le_bytes(payload[..8].try_into().unwrap());
@@ -1265,7 +2035,9 @@ impl<T: Transport> Tunnel<T> {
         // (Noise_IK verifies the initiator's static key) and passed the
         // freshness check, so the source address is trustworthy.
         *peer.endpoint.lock().unwrap() = Some(from);
-        self.telemetry.handshakes_completed.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .handshakes_completed
+            .fetch_add(1, Ordering::Relaxed);
         *peer.last_activity.lock().unwrap() = Instant::now();
         let mut resp = Vec::with_capacity(12 + msg2.len());
         resp.push(MSG_RESP);
@@ -1291,7 +2063,12 @@ impl<T: Transport> Tunnel<T> {
         };
         let msg2 = &frame[12..];
         let mut state = peer.state.lock().unwrap();
-        if let PeerState::AwaitingResponse { initiator, local_index, .. } = &mut *state {
+        if let PeerState::AwaitingResponse {
+            initiator,
+            local_index,
+            ..
+        } = &mut *state
+        {
             if *local_index != receiver_index {
                 return;
             }
@@ -1339,7 +2116,8 @@ impl<T: Transport> Tunnel<T> {
         let plain = {
             let mut state = peer.state.lock().unwrap();
             match &mut *state {
-                PeerState::Established { session, .. } => match session.open(counter, &frame[16..]) {
+                PeerState::Established { session, .. } => match session.open(counter, &frame[16..])
+                {
                     Ok(p) => p,
                     Err(e) => {
                         self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -1424,7 +2202,8 @@ impl<T: Transport> Tunnel<T> {
                     }
                 }
             }
-            KIND_STREAM_OPEN | KIND_STREAM_DATA | KIND_STREAM_CLOSE => {
+            KIND_STREAM_OPEN | KIND_STREAM_DATA | KIND_STREAM_CLOSE | KIND_STREAM_ACK
+            | KIND_STREAM_RESET => {
                 if dst_vip == self.local_vip {
                     // Same origin resolution as the data path: the
                     // ORIGINAL sender's role, never the relay's.
@@ -1432,7 +2211,8 @@ impl<T: Transport> Tunnel<T> {
                         .peer_by_vip(&src_vip)
                         .map(|p| p.role.lock().unwrap().clone())
                         .unwrap_or_else(|| peer.role.lock().unwrap().clone());
-                    self.deliver_stream_event(kind, &src_vip, src_role, &body);
+                    self.handle_stream_frame(kind, &src_vip, src_role, &body)
+                        .await;
                 } else if ttl > 1 {
                     // Relay toward the destination like data traffic;
                     // policy is enforced by the destination's gateway.
@@ -1515,7 +2295,14 @@ mod tests {
         (tunnel, rx, identity, telemetry)
     }
 
-    fn svc_rule(id: &str, role: &str, service: &str, port: u16, action: &str, priority: i32) -> AclRule {
+    fn svc_rule(
+        id: &str,
+        role: &str,
+        service: &str,
+        port: u16,
+        action: &str,
+        priority: i32,
+    ) -> AclRule {
         AclRule {
             id: id.to_string(),
             source_role: role.to_string(),
@@ -1529,24 +2316,48 @@ mod tests {
     #[test]
     fn acl_decision_matches_service_and_port() {
         let rules = vec![svc_rule("r1", "edge", "postgres", 5432, "ALLOW", 10)];
-        assert_eq!(acl_decision(&rules, "edge", "postgres", 5432), AclDecision::Allow);
+        assert_eq!(
+            acl_decision(&rules, "edge", "postgres", 5432),
+            AclDecision::Allow
+        );
         // Wrong port, wrong service, wrong role: no match, default deny.
-        assert_eq!(acl_decision(&rules, "edge", "postgres", 5433), AclDecision::DefaultDeny);
-        assert_eq!(acl_decision(&rules, "edge", "ssh", 5432), AclDecision::DefaultDeny);
-        assert_eq!(acl_decision(&rules, "iot", "postgres", 5432), AclDecision::DefaultDeny);
+        assert_eq!(
+            acl_decision(&rules, "edge", "postgres", 5433),
+            AclDecision::DefaultDeny
+        );
+        assert_eq!(
+            acl_decision(&rules, "edge", "ssh", 5432),
+            AclDecision::DefaultDeny
+        );
+        assert_eq!(
+            acl_decision(&rules, "iot", "postgres", 5432),
+            AclDecision::DefaultDeny
+        );
         // A specific service rule never leaks into the mesh-data gate.
-        assert_eq!(acl_decision(&rules, "edge", "mesh-data", 0), AclDecision::DefaultDeny);
+        assert_eq!(
+            acl_decision(&rules, "edge", "mesh-data", 0),
+            AclDecision::DefaultDeny
+        );
     }
 
     #[test]
     fn acl_decision_wildcards_and_deny_override() {
         // Wildcard service with a concrete port.
         let rules = vec![svc_rule("r1", "*", "*", 443, "ALLOW", 10)];
-        assert_eq!(acl_decision(&rules, "anyone", "https", 443), AclDecision::Allow);
-        assert_eq!(acl_decision(&rules, "anyone", "https", 80), AclDecision::DefaultDeny);
+        assert_eq!(
+            acl_decision(&rules, "anyone", "https", 443),
+            AclDecision::Allow
+        );
+        assert_eq!(
+            acl_decision(&rules, "anyone", "https", 80),
+            AclDecision::DefaultDeny
+        );
         // Port 0 in a rule matches any port of that service.
         let rules = vec![svc_rule("r1", "edge", "postgres", 0, "ALLOW", 10)];
-        assert_eq!(acl_decision(&rules, "edge", "postgres", 6543), AclDecision::Allow);
+        assert_eq!(
+            acl_decision(&rules, "edge", "postgres", 6543),
+            AclDecision::Allow
+        );
         // DENY overrides ALLOW even at a much worse priority number.
         let rules = vec![
             svc_rule("allow", "edge", "postgres", 5432, "ALLOW", 1),
@@ -1558,7 +2369,10 @@ mod tests {
         }
         // The mesh-data question still resolves through the same fn.
         let rules = vec![svc_rule("r1", "*", "*", 0, "ALLOW", 1)];
-        assert_eq!(acl_decision(&rules, "whoever", "mesh-data", 0), AclDecision::Allow);
+        assert_eq!(
+            acl_decision(&rules, "whoever", "mesh-data", 0),
+            AclDecision::Allow
+        );
     }
 
     #[tokio::test]
@@ -1566,8 +2380,18 @@ mod tests {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _tel_a) = make_node(&hub, 6101, "100.64.0.1", "edge").await;
         let (b, mut rx_b, id_b, _tel_b) = make_node(&hub, 6102, "100.64.0.2", "node").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.2", Some(b.local_addr()), "node");
-        b.add_peer(&id_a.public_hex(), "100.64.0.1", Some(a.local_addr()), "edge");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.2",
+            Some(b.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.1",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
         a.send_data("100.64.0.2", b"mesh says hello").await.unwrap();
@@ -1587,20 +2411,42 @@ mod tests {
         let (a, _rx_a, id_a, _t1) = make_node(&hub, 6111, "100.64.0.11", "node").await;
         let (b, _rx_b, id_b, _t2) = make_node(&hub, 6112, "100.64.0.12", "node").await;
         let (c, mut rx_c, id_c, _t3) = make_node(&hub, 6113, "100.64.0.13", "node").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.12", Some(b.local_addr()), "node");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.12",
+            Some(b.local_addr()),
+            "node",
+        );
         a.add_peer(&id_c.public_hex(), "100.64.0.13", None, "node");
         // Point A's route to C at B instead (next-hop relay).
         a.routes
             .lock()
             .unwrap()
             .insert([100, 64, 0, 13], id_b.public_hex());
-        b.add_peer(&id_a.public_hex(), "100.64.0.11", Some(a.local_addr()), "node");
-        b.add_peer(&id_c.public_hex(), "100.64.0.13", Some(c.local_addr()), "node");
-        c.add_peer(&id_b.public_hex(), "100.64.0.12", Some(b.local_addr()), "node");
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.11",
+            Some(a.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_c.public_hex(),
+            "100.64.0.13",
+            Some(c.local_addr()),
+            "node",
+        );
+        c.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.12",
+            Some(b.local_addr()),
+            "node",
+        );
         a.spawn_loops();
         b.spawn_loops();
         c.spawn_loops();
-        a.send_data("100.64.0.13", b"relayed payload").await.unwrap();
+        a.send_data("100.64.0.13", b"relayed payload")
+            .await
+            .unwrap();
         let (src, payload) = tokio::time::timeout(Duration::from_secs(5), rx_c.recv())
             .await
             .expect("relay timed out")
@@ -1614,9 +2460,13 @@ mod tests {
     async fn unknown_peer_handshake_is_dropped() {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _t1) = make_node(&hub, 6121, "100.64.0.21", "node").await;
-        let (stranger, _rx_s, _id_s, _t2) =
-            make_node(&hub, 6122, "100.64.0.22", "node").await;
-        stranger.add_peer(&id_a.public_hex(), "100.64.0.21", Some(a.local_addr()), "node");
+        let (stranger, _rx_s, _id_s, _t2) = make_node(&hub, 6122, "100.64.0.22", "node").await;
+        stranger.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.21",
+            Some(a.local_addr()),
+            "node",
+        );
         a.spawn_loops();
         stranger.spawn_loops();
         let res = stranger.send_data("100.64.0.21", b"intruder").await;
@@ -1629,8 +2479,18 @@ mod tests {
         let hub = MemoryHub::new();
         let (a, mut rx_a, id_a, _t) = make_node(&hub, 6301, "100.64.0.41", "edge").await;
         let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6302, "100.64.0.42", "db").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.42", Some(b.local_addr()), "db");
-        b.add_peer(&id_a.public_hex(), "100.64.0.41", Some(a.local_addr()), "edge");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.42",
+            Some(b.local_addr()),
+            "db",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.41",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
         // Both sides initiate at the same time; the tie-break must leave
@@ -1660,13 +2520,23 @@ mod tests {
         let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6312, "100.64.0.52", "db").await;
         // A does not know B's endpoint yet: the first send must fail...
         a.add_peer(&id_b.public_hex(), "100.64.0.52", None, "db");
-        b.add_peer(&id_a.public_hex(), "100.64.0.51", Some(a.local_addr()), "edge");
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.51",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
         assert!(a.send_data("100.64.0.52", b"too early").await.is_err());
         // ...but the peer must not stay wedged: once the endpoint is
         // known, a retry resets the stale attempt and completes.
-        a.add_peer(&id_b.public_hex(), "100.64.0.52", Some(b.local_addr()), "db");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.52",
+            Some(b.local_addr()),
+            "db",
+        );
         a.send_data("100.64.0.52", b"second attempt").await.unwrap();
         let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
             .await
@@ -1680,8 +2550,18 @@ mod tests {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _t) = make_node(&hub, 6321, "100.64.0.61", "edge").await;
         let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6322, "100.64.0.62", "db").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.62", Some(b.local_addr()), "db");
-        b.add_peer(&id_a.public_hex(), "100.64.0.61", Some(a.local_addr()), "edge");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.62",
+            Some(b.local_addr()),
+            "db",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.61",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
         a.send_data("100.64.0.62", b"before rekey").await.unwrap();
@@ -1722,7 +2602,10 @@ mod tests {
                 _ => panic!("not established"),
             }
         };
-        assert_ne!(index_before, index_after, "rekey must rotate the session index");
+        assert_ne!(
+            index_before, index_after,
+            "rekey must rotate the session index"
+        );
     }
 
     #[tokio::test]
@@ -1731,10 +2614,30 @@ mod tests {
         let (a, _rx_a, id_a, _t) = make_node(&hub, 6331, "100.64.0.11", "node").await;
         let (b, _rx_b, id_b, _t2) = make_node(&hub, 6332, "100.64.0.12", "node").await;
         let (c, mut rx_c, id_c, _t3) = make_node(&hub, 6333, "100.64.0.13", "node").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.12", Some(b.local_addr()), "node");
-        b.add_peer(&id_a.public_hex(), "100.64.0.11", Some(a.local_addr()), "node");
-        b.add_peer(&id_c.public_hex(), "100.64.0.13", Some(c.local_addr()), "node");
-        c.add_peer(&id_b.public_hex(), "100.64.0.12", Some(b.local_addr()), "node");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.12",
+            Some(b.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.11",
+            Some(a.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_c.public_hex(),
+            "100.64.0.13",
+            Some(c.local_addr()),
+            "node",
+        );
+        c.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.12",
+            Some(b.local_addr()),
+            "node",
+        );
         a.spawn_loops();
         b.spawn_loops();
         c.spawn_loops();
@@ -1759,7 +2662,11 @@ mod tests {
             };
             let mut state = peer.state.lock().unwrap();
             let (counter, remote_index, ct) = match &mut *state {
-                PeerState::Established { session, remote_index, .. } => {
+                PeerState::Established {
+                    session,
+                    remote_index,
+                    ..
+                } => {
                     let (c, ct) = session.seal(&inner).unwrap();
                     (c, *remote_index, ct)
                 }
@@ -1866,8 +2773,18 @@ mod tests {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _t) = make_node(&hub, 6201, "100.64.0.21", "edge").await;
         let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6202, "100.64.0.22", "db").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.22", Some(b.local_addr()), "db");
-        b.add_peer(&id_a.public_hex(), "100.64.0.21", Some(a.local_addr()), "edge");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.22",
+            Some(b.local_addr()),
+            "db",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.21",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
         a.send_data("100.64.0.22", b"before attack").await.unwrap();
@@ -1919,8 +2836,18 @@ mod tests {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _t) = make_node(&hub, 6211, "100.64.0.31", "edge").await;
         let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6212, "100.64.0.32", "db").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.32", Some(b.local_addr()), "db");
-        b.add_peer(&id_a.public_hex(), "100.64.0.31", Some(a.local_addr()), "edge");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.32",
+            Some(b.local_addr()),
+            "db",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.31",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
         a.send_data("100.64.0.32", b"session one").await.unwrap();
@@ -1950,7 +2877,9 @@ mod tests {
             assert_eq!(endpoint, Some(a.local_addr()));
         }
         // ...and the live session must still work.
-        a.send_data("100.64.0.32", b"session still alive").await.unwrap();
+        a.send_data("100.64.0.32", b"session still alive")
+            .await
+            .unwrap();
         let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
             .await
             .expect("timeout")
@@ -1963,10 +2892,19 @@ mod tests {
         use crate::wire::AclRule;
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _tel_a) = make_node(&hub, 6131, "100.64.0.31", "edge").await;
-        let (b, mut rx_b, id_b, tel_b) =
-            make_node(&hub, 6132, "100.64.0.32", "database").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.32", Some(b.local_addr()), "database");
-        b.add_peer(&id_a.public_hex(), "100.64.0.31", Some(a.local_addr()), "edge");
+        let (b, mut rx_b, id_b, tel_b) = make_node(&hub, 6132, "100.64.0.32", "database").await;
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.32",
+            Some(b.local_addr()),
+            "database",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.31",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
 
@@ -2017,10 +2955,19 @@ mod tests {
     async fn acl_default_deny_without_allow_rule() {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _tel_a) = make_node(&hub, 6141, "100.64.0.41", "edge").await;
-        let (b, mut rx_b, id_b, tel_b) =
-            make_node(&hub, 6142, "100.64.0.42", "database").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.42", Some(b.local_addr()), "database");
-        b.add_peer(&id_a.public_hex(), "100.64.0.41", Some(a.local_addr()), "edge");
+        let (b, mut rx_b, id_b, tel_b) = make_node(&hub, 6142, "100.64.0.42", "database").await;
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.42",
+            Some(b.local_addr()),
+            "database",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.41",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
 
@@ -2043,9 +2990,14 @@ mod tests {
             priority: 1,
         }]);
         let drops_before = tel_b.snapshot().drops;
-        a.send_data("100.64.0.42", b"still denied at b").await.unwrap();
+        a.send_data("100.64.0.42", b"still denied at b")
+            .await
+            .unwrap();
         let blocked = tokio::time::timeout(Duration::from_millis(600), rx_b.recv()).await;
-        assert!(blocked.is_err(), "default-deny packet must not be delivered");
+        assert!(
+            blocked.is_err(),
+            "default-deny packet must not be delivered"
+        );
         assert!(
             tel_b.snapshot().drops > drops_before,
             "drop counter must record the default-deny drop"
@@ -2091,8 +3043,18 @@ mod tests {
         let hub = MemoryHub::new();
         let (a, _rx_a, id_a, _tel_a) = make_node(&hub, 6171, "100.64.0.71", "edge").await;
         let (b, mut rx_b, id_b, tel_b) = make_node(&hub, 6172, "100.64.0.72", "node").await;
-        a.add_peer(&id_b.public_hex(), "100.64.0.72", Some(b.local_addr()), "node");
-        b.add_peer(&id_a.public_hex(), "100.64.0.71", Some(a.local_addr()), "edge");
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.0.72",
+            Some(b.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.0.71",
+            Some(a.local_addr()),
+            "edge",
+        );
         a.spawn_loops();
         b.spawn_loops();
 
@@ -2128,5 +3090,253 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
         assert_eq!(p, b"after flood");
+    }
+
+    // -- reliable streams ------------------------------------------------
+
+    async fn make_node_chaos(
+        hub: &Arc<MemoryHub>,
+        port: u16,
+        vip: &str,
+        role: &str,
+        seed: u64,
+    ) -> (Arc<Tunnel<ChaosTransport>>, Identity) {
+        let dir = std::env::temp_dir().join(format!(
+            "kronos-chaos-{}-{}",
+            std::process::id(),
+            vip.replace('.', "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let identity = Identity::load_or_create(&dir).unwrap();
+        let (tunnel, _rx) = Tunnel::bind_with_transport(
+            ChaosTransport::wrap(hub.register(addr(port)), seed, 10, 5),
+            Identity::load_or_create(&dir).unwrap(),
+            vip,
+            role,
+            Arc::new(TelemetryCounters::default()),
+            Arc::new(EventRing::new(64)),
+        )
+        .unwrap();
+        tunnel.update_acls(&[crate::wire::AclRule {
+            id: "test-allow-all".to_string(),
+            source_role: "*".to_string(),
+            dest_service: "*".to_string(),
+            port: 0,
+            action: "ALLOW".to_string(),
+            priority: 1,
+        }]);
+        (tunnel, identity)
+    }
+
+    fn pattern(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i * 31 + seed as usize * 17) % 251) as u8)
+            .collect()
+    }
+
+    async fn chaos_pair(
+        base_port: u16,
+        vip_a: &'static str,
+        vip_b: &'static str,
+    ) -> (Arc<Tunnel<ChaosTransport>>, Arc<Tunnel<ChaosTransport>>) {
+        let hub = MemoryHub::new();
+        let (a, id_a) = make_node_chaos(&hub, base_port, vip_a, "edge", 0xA5A5_1234).await;
+        let (b, id_b) = make_node_chaos(&hub, base_port + 1, vip_b, "node", 0x5A5A_9876).await;
+        a.add_peer(&id_b.public_hex(), vip_b, Some(b.local_addr()), "node");
+        b.add_peer(&id_a.public_hex(), vip_a, Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        (a, b)
+    }
+
+    /// The core reliability claim: 100 KB pushed through a stream
+    /// over a transport that drops 10%, duplicates 5% and reorders
+    /// 20% of datagrams arrives byte-exact and in order, and the
+    /// sender learns its CLOSE was fully delivered.
+    #[tokio::test]
+    async fn stream_transfer_is_byte_exact_over_chaos() {
+        let (a, b) = chaos_pair(6411, "100.64.21.1", "100.64.21.2").await;
+        let payload = pattern(100_000, 7);
+        let send_a = a.clone();
+        let expect = payload.clone();
+        let sender = tokio::spawn(async move {
+            send_a
+                .send_stream_open("100.64.21.2", 42, "bulk", 9000)
+                .await
+                .unwrap();
+            send_a
+                .send_stream_data("100.64.21.2", 42, &expect)
+                .await
+                .unwrap();
+            send_a.send_stream_close("100.64.21.2", 42).await.unwrap();
+        });
+        let mut received = Vec::new();
+        let read = async {
+            while let Some(chunk) = b.next_stream_data("100.64.21.1", 42).await {
+                received.extend_from_slice(&chunk);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), read)
+            .await
+            .expect("stream read timed out over chaos transport");
+        sender.await.unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(
+            received, payload,
+            "stream bytes must arrive exact and in order"
+        );
+        // The CLOSE must be acknowledged complete at the sender.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !a.stream_close_acked("100.64.21.2", 42) {
+            assert!(Instant::now() < deadline, "close was never acked complete");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A CLOSE sent immediately after the data (so it can overtake
+    /// frames on the wire) must not truncate the stream: the reader
+    /// still receives every byte before end-of-stream.
+    #[tokio::test]
+    async fn stream_close_overtaking_data_still_delivers_everything() {
+        let (a, b) = chaos_pair(6421, "100.64.22.1", "100.64.22.2").await;
+        let payload = pattern(40_000, 3);
+        a.send_stream_open("100.64.22.2", 7, "bulk", 9000)
+            .await
+            .unwrap();
+        a.send_stream_data("100.64.22.2", 7, &payload)
+            .await
+            .unwrap();
+        a.send_stream_close("100.64.22.2", 7).await.unwrap();
+        let mut received = Vec::new();
+        let read = async {
+            while let Some(chunk) = b.next_stream_data("100.64.22.1", 7).await {
+                received.extend_from_slice(&chunk);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), read)
+            .await
+            .expect("pipelined close truncated the stream");
+        assert_eq!(received, payload);
+    }
+
+    /// Backpressure + reset: with nobody consuming at the receiver,
+    /// the sender's window fills and its send blocks (it must NOT
+    /// drop bytes to proceed). A RESET then wakes the blocked send
+    /// with an error.
+    #[tokio::test]
+    async fn stream_blocked_sender_is_woken_by_reset_not_by_dropping() {
+        let (a, b) = chaos_pair(6431, "100.64.23.1", "100.64.23.2").await;
+        a.send_stream_open("100.64.23.2", 9, "bulk", 9000)
+            .await
+            .unwrap();
+        // Nobody ever pulls next_stream_data at B: at most WINDOW +
+        // DELIVERY frames can be absorbed; 512 KB cannot complete.
+        let big = pattern(512_000, 5);
+        let send_a = a.clone();
+        let sender =
+            tokio::spawn(async move { send_a.send_stream_data("100.64.23.2", 9, &big).await });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !sender.is_finished(),
+            "send must block on a full window instead of dropping bytes"
+        );
+        b.reset_stream("100.64.23.1", 9).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), sender)
+            .await
+            .expect("blocked sender was not woken by the reset")
+            .unwrap();
+        assert!(result.is_err(), "send on a reset stream must fail");
+    }
+
+    /// Debug/isolation probe: both directions bulk simultaneously.
+    #[tokio::test]
+    async fn stream_bidirectional_bulk_over_chaos() {
+        let (a, b) = chaos_pair(6481, "100.64.24.1", "100.64.24.2").await;
+        let pa = pattern(100_000, 21);
+        let pb = pattern(100_000, 22);
+        let (a2, b2) = (a.clone(), b.clone());
+        let (pa2, pb2) = (pa.clone(), pb.clone());
+        let t1 = tokio::spawn(async move {
+            a2.send_stream_open("100.64.24.2", 5, "bulk", 9000)
+                .await
+                .unwrap();
+            a2.send_stream_data("100.64.24.2", 5, &pa2).await.unwrap();
+            a2.send_stream_close("100.64.24.2", 5).await.unwrap();
+        });
+        let t2 = tokio::spawn(async move {
+            b2.send_stream_open("100.64.24.1", 5, "bulk", 9000)
+                .await
+                .unwrap();
+            b2.send_stream_data("100.64.24.1", 5, &pb2).await.unwrap();
+            b2.send_stream_close("100.64.24.1", 5).await.unwrap();
+        });
+        let mut ra = Vec::new();
+        let mut rb = Vec::new();
+        let read = async {
+            // Pull both directions alternately.
+            let (mut done_a, mut done_b) = (false, false);
+            while !(done_a && done_b) {
+                tokio::select! {
+                    r = a.next_stream_data("100.64.24.2", 5), if !done_b => {
+                        match r { Some(c) => rb.extend_from_slice(&c), None => done_b = true }
+                    }
+                    r = b.next_stream_data("100.64.24.1", 5), if !done_a => {
+                        match r { Some(c) => ra.extend_from_slice(&c), None => done_a = true }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), read)
+            .await
+            .expect("bidir read timed out");
+        t1.await.unwrap();
+        t2.await.unwrap();
+        assert_eq!(ra, pa);
+        assert_eq!(rb, pb);
+    }
+
+    /// Gateway-pattern probe: only A opens; B echoes per chunk
+    /// without ever opening its own direction.
+    #[tokio::test]
+    async fn stream_gateway_pattern_over_chaos() {
+        let (a, b) = chaos_pair(6501, "100.64.25.1", "100.64.25.2").await;
+        // B: echo pump — pull a chunk, send it straight back.
+        let b_echo = b.clone();
+        let echo = tokio::spawn(async move {
+            while let Some(chunk) = b_echo.next_stream_data("100.64.25.1", 5).await {
+                if b_echo
+                    .send_stream_data("100.64.25.1", 5, &chunk)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        a.send_stream_open("100.64.25.2", 5, "echo", 9000)
+            .await
+            .unwrap();
+        let payload = pattern(32_000, 11);
+        a.send_stream_data("100.64.25.2", 5, &payload[..16_384])
+            .await
+            .unwrap();
+        a.send_stream_data("100.64.25.2", 5, &payload[16_384..])
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        let read = async {
+            while received.len() < payload.len() {
+                match a.next_stream_data("100.64.25.2", 5).await {
+                    Some(c) => received.extend_from_slice(&c),
+                    None => break,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(15), read)
+            .await
+            .expect("gateway-pattern read timed out");
+        echo.abort();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
     }
 }
