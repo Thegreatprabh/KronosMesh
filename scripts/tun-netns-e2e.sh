@@ -75,6 +75,17 @@ ip netns exec "$NS_B" ip link set veth-b up
 ip netns exec "$NS_B" ip link set lo up
 ip netns exec "$NS_B" ip route add 10.99.1.0/24 via 10.99.2.1
 sysctl -qw net.ipv4.ip_forward=1
+# Some hosts (notably CI runners with Docker installed) default
+# the FORWARD chain to DROP for non-bridge traffic. The host is
+# this topology's router, so accept forwarding between the two
+# namespace links explicitly.
+iptables -I FORWARD -i veth-ha -o veth-hb -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -i veth-hb -o veth-ha -j ACCEPT 2>/dev/null || true
+
+echo "== underlay sanity (namespace links) =="
+ip netns exec "$NS_A" ping -c 1 -W 2 10.99.2.2 >/dev/null || { echo "FAIL: underlay A->B veth path broken"; exit 1; }
+ip netns exec "$NS_B" ping -c 1 -W 2 10.99.1.2 >/dev/null || { echo "FAIL: underlay B->A veth path broken"; exit 1; }
+echo "underlay links OK"
 
 echo "== control plane on the host =="
 KRONOS_ADMIN_TOKEN="$ADMIN_TOKEN" PORT=8080 "$CP" >"$WORK/cp.log" 2>&1 &
@@ -86,6 +97,9 @@ curl -sf -X POST http://127.0.0.1:8080/api/v1/acls \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"source_role":"*","dest_service":"*","port":0,"action":"ALLOW","priority":1}' >/dev/null
 echo "control plane up, allow-all mesh-data rule seeded"
+ip netns exec "$NS_A" curl -sf http://10.99.1.1:8080/api/v1/health >/dev/null || { echo "FAIL: control plane unreachable from namespace A"; exit 1; }
+ip netns exec "$NS_B" curl -sf http://10.99.2.1:8080/api/v1/health >/dev/null || { echo "FAIL: control plane unreachable from namespace B"; exit 1; }
+echo "control plane reachable from both namespaces"
 
 echo "== daemons with TUN on (B first: A needs B's VIP for its service forward) =="
 ip netns exec "$NS_B" env \
@@ -142,7 +156,18 @@ for i in $(seq 1 30); do
   if ip netns exec "$NS_A" ping -c 1 -W 2 "$VIP_B" >/dev/null 2>&1; then ok=1; break; fi
   sleep 2
 done
-[ "$ok" = 1 ] || { echo "FAIL: ping never crossed the mesh"; tail -20 "$WORK/a.log" "$WORK/b.log"; exit 1; }
+if [ "$ok" != 1 ]; then
+  echo "FAIL: ping never crossed the mesh"
+  echo "---- node A log (last 60 lines) ----"; tail -n 60 "$WORK/a.log" || true
+  echo "---- node B log (last 60 lines) ----"; tail -n 60 "$WORK/b.log" || true
+  echo "---- node A peers ----"
+  ip netns exec "$NS_A" env KRONOS_NODE_NAME=node-a KRONOS_CONTROL_URL="http://10.99.1.1:8080" KRONOS_CONTROL_TOKEN="$ADMIN_TOKEN" KRONOS_ALLOW_INSECURE_HTTP=1 KRONOS_STATE_DIR="$WORK/a" "$DAEMON" peers || true
+  echo "---- node B peers ----"
+  ip netns exec "$NS_B" env KRONOS_NODE_NAME=node-b KRONOS_CONTROL_URL="http://10.99.2.1:8080" KRONOS_CONTROL_TOKEN="$ADMIN_TOKEN" KRONOS_ALLOW_INSECURE_HTTP=1 KRONOS_STATE_DIR="$WORK/b" "$DAEMON" peers || true
+  echo "---- underlay still alive? ----"
+  ip netns exec "$NS_A" ping -c 1 -W 2 10.99.2.2 || true
+  exit 1
+fi
 ip netns exec "$NS_A" ping -c 3 -W 2 "$VIP_B"
 echo "PASS: ICMP crossed the encrypted mesh between host stacks"
 

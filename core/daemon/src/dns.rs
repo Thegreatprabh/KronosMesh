@@ -577,7 +577,20 @@ mod tests {
             avg_latency_ms: 0.0,
         };
         update_names(&table, &[peer], "node-a", vip);
-        let server = tokio::spawn(serve(vip, table, "1.1.1.1:53".to_string()));
+        // serve() gets its own thread and runtime. The test body
+        // below blocks this test's thread in a synchronous recv
+        // loop; on the single-threaded test runtime that starves
+        // any task spawned here — the queries would be written
+        // but the server would never be scheduled to answer
+        // them. (The production daemon uses a multi-threaded
+        // runtime, so this trap exists only in the test harness.)
+        let _server_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("dns test runtime");
+            let _ = rt.block_on(serve(vip, table, "1.1.1.1:53".to_string()));
+        });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let writer = device.writer_handle();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -625,7 +638,8 @@ mod tests {
                 break;
             }
         }
-        server.abort();
+        // The server thread is detached; it dies with the test
+        // process.
         teardown(&dev_name);
         assert_eq!(
             answer_ip,

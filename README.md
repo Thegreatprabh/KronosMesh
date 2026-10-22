@@ -9,7 +9,7 @@ An open-source alternative to Tailscale and Cloudflare Tunnels  -  connect serve
 
 [![CI](https://github.com/Thegreatprabh/KronosMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/Thegreatprabh/KronosMesh/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)
-![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8)
+![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8)
 ![eBPF](https://img.shields.io/badge/eBPF-XDP%20probe-blueviolet)
 ![License](https://img.shields.io/badge/License-MIT-green)
 

@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 # go.sum is optional in the build context: the glob keeps the build
 # working when only go.mod is present, and `go mod download` resolves
