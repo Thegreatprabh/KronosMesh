@@ -98,6 +98,12 @@ pub enum DataPlaneMode {
 pub struct EbpfStatus {
     pub mode: DataPlaneMode,
     pub enabled: bool,
+    /// True only when the kernel actually accepted the XDP probe
+    /// program (capability confirmed). This is NOT a fast-path signal:
+    /// the probe is closed immediately and never attached, and
+    /// `enabled` stays false in this release — the two facts are
+    /// reported separately so no consumer can conflate them.
+    pub probe_passed: bool,
     pub reason: String,
     pub kernel: String,
     pub object_path: Option<String>,
@@ -237,6 +243,7 @@ impl EbpfLoader {
                             return EbpfStatus {
                                 mode: DataPlaneMode::UserspaceFallback,
                                 enabled: false,
+                                probe_passed: false,
                                 reason,
                                 kernel,
                                 object_path: Some(path.to_string()),
@@ -250,6 +257,7 @@ impl EbpfLoader {
                         return EbpfStatus {
                             mode: DataPlaneMode::UserspaceFallback,
                             enabled: false,
+                            probe_passed: false,
                             reason,
                             kernel,
                             object_path: Some(path.to_string()),
@@ -278,6 +286,7 @@ impl EbpfLoader {
                     EbpfStatus {
                         mode: DataPlaneMode::UserspaceFallback,
                         enabled: false,
+                        probe_passed: true,
                         reason,
                         kernel,
                         object_path: object_path.map(|s| s.to_string()),
@@ -294,6 +303,7 @@ impl EbpfLoader {
                     EbpfStatus {
                         mode: DataPlaneMode::UserspaceFallback,
                         enabled: false,
+                        probe_passed: false,
                         reason,
                         kernel,
                         object_path: object_path.map(|s| s.to_string()),
@@ -310,6 +320,7 @@ impl EbpfLoader {
             EbpfStatus {
                 mode: DataPlaneMode::UserspaceFallback,
                 enabled: false,
+                probe_passed: false,
                 reason,
                 kernel,
                 object_path: object_path.map(|s| s.to_string()),

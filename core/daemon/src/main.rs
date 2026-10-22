@@ -16,7 +16,7 @@ use kronos_daemon::config::{proposed_virtual_ip, Config, Identity, NodeState};
 use kronos_daemon::control_client::{discover_endpoint, ControlClient};
 use kronos_daemon::ebpf_loader::{EbpfLoader, EventRing, TelemetryCounters};
 use kronos_daemon::tunnel::{MemoryHub, Tunnel};
-use kronos_daemon::wire::{HeartbeatPayload, NodeRegisterRequest};
+use kronos_daemon::wire::{AclRule, HeartbeatPayload, NodeRegisterRequest};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -87,41 +87,12 @@ async fn run_up(cfg: Config) -> Result<()> {
 
     let proposed_ip = proposed_virtual_ip(identity.public.as_bytes());
     let existing = NodeState::load(&cfg.state_dir);
+    // Fallback address if the control plane cannot be reached: our
+    // previously assigned VIP, else the proposed one.
     let local_vip = existing
         .as_ref()
         .map(|s| s.virtual_ip.clone())
         .unwrap_or_else(|| proposed_ip.clone());
-
-    let (tunnel, mut app_rx) = Tunnel::bind(
-        cfg.listen_port,
-        Identity::load_or_create(&cfg.state_dir)?,
-        &local_vip,
-        &cfg.role,
-        telemetry.clone(),
-        ring.clone(),
-    )
-    .await
-    .context("binding tunnel socket")?;
-    tunnel.set_freshness_dir(&cfg.state_dir);
-    tunnel.spawn_loops();
-    eprintln!(
-        "[kronos] node {} listening on {} (virtual {})",
-        cfg.node_name,
-        tunnel.local_addr(),
-        local_vip
-    );
-
-    // Application sink: decrypted payloads addressed to this node are
-    // logged (a TUN consumer would take them from here in fast-path
-    // deployments).
-    tokio::spawn(async move {
-        while let Some((src, data)) = app_rx.recv().await {
-            eprintln!(
-                "[kronos] packet from {src}: {} bytes",
-                data.len()
-            );
-        }
-    });
 
     let client = ControlClient::new(&cfg.control_url);
     let discovered = discover_endpoint(cfg.stun_server.as_deref(), cfg.listen_port).await;
@@ -135,15 +106,24 @@ async fn run_up(cfg: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| discovered.endpoint.clone());
     eprintln!("[kronos] advertising endpoint {advertised_endpoint}");
+    // Registration runs BEFORE the tunnel is bound. The control plane
+    // is the authority on virtual IPs: when the requested address is
+    // already taken it assigns a different one, and the tunnel must
+    // bind the ASSIGNED address. (The previous order bound the tunnel
+    // first, so after a collision the running tunnel kept the requested
+    // address while the state file and the mesh used the assigned one —
+    // traffic for this node was routed to an address it never held.)
+    // We ask for our previous address when we have one (restart
+    // stability); the plane keeps it when it is still ours or free.
     let register_req = NodeRegisterRequest {
         node_name: cfg.node_name.clone(),
         public_key: identity.public_hex(),
         fingerprint: identity.fingerprint(),
-        virtual_ip: proposed_ip.clone(),
+        virtual_ip: local_vip.clone(),
         endpoint: advertised_endpoint,
         role: cfg.role.clone(),
         nat_type: discovered.nat_type.clone(),
-        ebpf_enabled: ebpf_status.enabled,
+        ebpf_probe_passed: ebpf_status.probe_passed,
         version: VERSION.to_string(),
     };
     // Credential for this registration: an operator token from config
@@ -168,7 +148,6 @@ async fn run_up(cfg: Config) -> Result<()> {
                 node_token: effective_token.clone(),
             }
             .save(&cfg.state_dir)?;
-            tunnel.update_peers(&r.peers);
             Some((r, effective_token))
         }
         Err(e) => {
@@ -178,6 +157,54 @@ async fn run_up(cfg: Config) -> Result<()> {
             None
         }
     };
+
+    // Bind the tunnel on the address the mesh will actually route to:
+    // the control plane's assignment when registration succeeded, else
+    // the local fallback for peer-to-peer-only operation.
+    let assigned_vip = registration
+        .as_ref()
+        .map(|(r, _)| r.assigned_virtual_ip.as_str());
+    let bind_vip = effective_vip(assigned_vip, &local_vip);
+    if let Some(assigned) = assigned_vip {
+        if assigned != local_vip {
+            eprintln!(
+                "[kronos] requested vip {local_vip} unavailable; binding the assigned vip {assigned} instead"
+            );
+        }
+    }
+    let (tunnel, mut app_rx) = Tunnel::bind(
+        cfg.listen_port,
+        Identity::load_or_create(&cfg.state_dir)?,
+        &bind_vip,
+        &cfg.role,
+        telemetry.clone(),
+        ring.clone(),
+    )
+    .await
+    .context("binding tunnel socket")?;
+    tunnel.set_freshness_dir(&cfg.state_dir);
+    if let Some((r, _)) = &registration {
+        tunnel.update_peers(&r.peers);
+    }
+    tunnel.spawn_loops();
+    eprintln!(
+        "[kronos] node {} listening on {} (virtual {})",
+        cfg.node_name,
+        tunnel.local_addr(),
+        bind_vip
+    );
+
+    // Application sink: decrypted payloads addressed to this node are
+    // logged (a TUN consumer would take them from here in fast-path
+    // deployments).
+    tokio::spawn(async move {
+        while let Some((src, data)) = app_rx.recv().await {
+            eprintln!(
+                "[kronos] packet from {src}: {} bytes",
+                data.len()
+            );
+        }
+    });
 
     let (node_id, node_token) = match &registration {
         Some((r, tok)) => (Some(r.node_id.clone()), tok.clone()),
@@ -327,6 +354,20 @@ async fn run_bench(seconds: u64, payload_size: usize) -> Result<()> {
     };
     let (a, _rx_a, a_pub) = mk(&dir_a, 6201, "100.64.0.1");
     let (b, mut rx_b, b_pub) = mk(&dir_b, 6202, "100.64.0.2");
+    // Bench nodes are standalone: no control plane syncs policy to
+    // them, and the data plane is default-deny. The bench therefore
+    // applies an explicit local allow-all policy to its own two nodes —
+    // the same step an operator performs before sending traffic.
+    let bench_policy = [AclRule {
+        id: "bench-allow-all".to_string(),
+        source_role: "*".to_string(),
+        dest_service: "*".to_string(),
+        port: 0,
+        action: "ALLOW".to_string(),
+        priority: 1,
+    }];
+    a.update_acls(&bench_policy);
+    b.update_acls(&bench_policy);
     a.add_peer(&b_pub, "100.64.0.2", Some(b.local_addr()), "node");
     b.add_peer(&a_pub, "100.64.0.1", Some(a.local_addr()), "node");
     a.spawn_loops();
@@ -372,4 +413,32 @@ async fn run_bench(seconds: u64, payload_size: usize) -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
     Ok(())
+}
+
+/// The virtual IP the tunnel binds: the control plane's assignment
+/// when registration succeeded (the plane is authoritative — a
+/// collision may have moved us off the requested address), else the
+/// locally persisted / proposed fallback for peer-to-peer-only runs.
+fn effective_vip(assigned: Option<&str>, fallback: &str) -> String {
+    assigned.unwrap_or(fallback).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assigned_vip_wins_over_requested() {
+        // Collision case: we asked for the fallback address, the plane
+        // assigned another — the tunnel must bind the assigned one.
+        assert_eq!(
+            effective_vip(Some("100.64.0.9"), "100.64.0.2"),
+            "100.64.0.9"
+        );
+    }
+
+    #[test]
+    fn fallback_vip_used_when_registration_failed() {
+        assert_eq!(effective_vip(None, "100.64.0.2"), "100.64.0.2");
+    }
 }

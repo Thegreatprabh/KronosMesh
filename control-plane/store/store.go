@@ -2,8 +2,11 @@
 // thread-safe in-memory store that is authoritative for reads, with an
 // optional Redis write-through mirror. The control plane works fully
 // out of the box with no Redis running; when REDIS_ADDR points at a
-// reachable server, node and policy writes are mirrored there for
-// external tooling and inspection.
+// reachable server, every node and policy write is mirrored there as
+// full state, and at startup RecoverFromMirror rebuilds the registry
+// and policy from that mirror — so a control-plane restart no longer
+// loses the mesh. Without Redis the state is memory-only and a restart
+// starts empty (nodes simply re-register).
 package store
 
 import (
@@ -16,6 +19,8 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -168,7 +173,7 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 			node.Role = req.Role
 		}
 		node.NATType = req.NATType
-		node.EBPFEnabled = req.EBPFEnabled
+		node.EBPFProbePassed = req.EBPFProbePassed
 		node.Online = true
 		node.LastSeen = now
 		issued := ""
@@ -188,18 +193,18 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 	}
 	issued := newNodeToken()
 	node := &models.PeerNode{
-		NodeID:      uuid.NewString(),
-		NodeName:    req.NodeName,
-		PublicKey:   req.PublicKey,
-		Fingerprint: req.Fingerprint,
-		VirtualIP:   virtualIP,
-		TokenHash:   hashToken(issued),
-		Endpoint:    req.Endpoint,
-		Role:        req.Role,
-		Online:      true,
-		NATType:     req.NATType,
-		EBPFEnabled: req.EBPFEnabled,
-		LastSeen:    now,
+		NodeID:          uuid.NewString(),
+		NodeName:        req.NodeName,
+		PublicKey:       req.PublicKey,
+		Fingerprint:     req.Fingerprint,
+		VirtualIP:       virtualIP,
+		TokenHash:       hashToken(issued),
+		Endpoint:        req.Endpoint,
+		Role:            req.Role,
+		Online:          true,
+		NATType:         req.NATType,
+		EBPFProbePassed: req.EBPFProbePassed,
+		LastSeen:        now,
 	}
 	s.byID[node.NodeID] = node
 	s.byKey[node.PublicKey] = node.NodeID
@@ -357,17 +362,115 @@ func (s *MemoryStore) mirrorNode(node *models.PeerNode) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	key := "kronos:node:" + node.NodeID
-	err := s.mirror.HSet(ctx, key,
-		"node_name", node.NodeName,
-		"public_key", node.PublicKey,
-		"virtual_ip", node.VirtualIP,
-		"endpoint", node.Endpoint,
-		"online", node.Online,
-		"last_seen", node.LastSeen.Format(time.RFC3339),
-	).Err()
-	if err != nil {
+	if err := s.mirror.HSet(ctx, key, nodeToHash(node)).Err(); err != nil {
 		log.Printf("store: redis mirror write failed for %s: %v", node.NodeID, err)
 	}
+}
+
+// nodeToHash serializes a node for the Redis mirror. It carries the
+// FULL state recovery needs after a restart — identity, role, the
+// credential hash (never the token itself) and telemetry. An earlier
+// mirror stored only display fields, which made faithful recovery
+// impossible: a rebuilt node could not even authenticate heartbeats.
+func nodeToHash(node *models.PeerNode) map[string]interface{} {
+	return map[string]interface{}{
+		"node_name":         node.NodeName,
+		"public_key":        node.PublicKey,
+		"fingerprint":       node.Fingerprint,
+		"virtual_ip":        node.VirtualIP,
+		"endpoint":          node.Endpoint,
+		"role":              node.Role,
+		"nat_type":          node.NATType,
+		"ebpf_probe_passed": node.EBPFProbePassed,
+		"online":            node.Online,
+		"last_seen":         node.LastSeen.Format(time.RFC3339),
+		"token_hash":        node.TokenHash,
+		"tx_bytes":          node.TxBytes,
+		"rx_bytes":          node.RxBytes,
+		"avg_latency_ms":    node.AvgLatencyMs,
+		"established_peers": mustJSON(node.EstablishedPeers),
+	}
+}
+
+// nodeFromHash parses a mirrored node back. Missing fields (mirrors
+// written by older versions) degrade to zero values; a node without a
+// public key or virtual IP is unusable and reported as an error. A
+// node recovered without a token hash cannot heartbeat — it must
+// re-register with the admin token, which is the honest failure mode.
+func nodeFromHash(nodeID string, f map[string]string) (*models.PeerNode, error) {
+	if f["public_key"] == "" || f["virtual_ip"] == "" {
+		return nil, fmt.Errorf("mirrored node %s lacks a public key or virtual IP", nodeID)
+	}
+	node := &models.PeerNode{
+		NodeID:          nodeID,
+		NodeName:        f["node_name"],
+		PublicKey:       f["public_key"],
+		Fingerprint:     f["fingerprint"],
+		VirtualIP:       f["virtual_ip"],
+		Endpoint:        f["endpoint"],
+		Role:            f["role"],
+		NATType:         f["nat_type"],
+		EBPFProbePassed: f["ebpf_probe_passed"] == "true",
+		Online:          f["online"] == "true",
+		TokenHash:       f["token_hash"],
+	}
+	if ts, err := time.Parse(time.RFC3339, f["last_seen"]); err == nil {
+		node.LastSeen = ts
+	}
+	node.TxBytes, _ = strconv.ParseUint(f["tx_bytes"], 10, 64)
+	node.RxBytes, _ = strconv.ParseUint(f["rx_bytes"], 10, 64)
+	node.AvgLatencyMs, _ = strconv.ParseFloat(f["avg_latency_ms"], 64)
+	if raw := f["established_peers"]; raw != "" && raw != "null" {
+		_ = json.Unmarshal([]byte(raw), &node.EstablishedPeers)
+	}
+	return node, nil
+}
+
+// RecoverFromMirror rebuilds the registry and ACL policy from the
+// Redis mirror after a control-plane restart. Recovered nodes come
+// back OFFLINE — the mirror proves they existed, not that they are
+// alive; a heartbeat (authenticated by the recovered token hash)
+// marks them online again. Returns the number of nodes and ACL rules
+// recovered. With no mirror configured it is a no-op.
+func (s *MemoryStore) RecoverFromMirror() (int, int, error) {
+	if s.mirror == nil {
+		return 0, 0, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys, err := s.mirror.Keys(ctx, "kronos:node:*").Result()
+	if err != nil {
+		return 0, 0, fmt.Errorf("listing mirrored nodes: %w", err)
+	}
+	nodes := 0
+	for _, key := range keys {
+		fields, err := s.mirror.HGetAll(ctx, key).Result()
+		if err != nil || len(fields) == 0 {
+			continue
+		}
+		node, err := nodeFromHash(strings.TrimPrefix(key, "kronos:node:"), fields)
+		if err != nil {
+			log.Printf("store: skipping unrecoverable mirrored node: %v", err)
+			continue
+		}
+		node.Online = false
+		s.byID[node.NodeID] = node
+		s.byKey[node.PublicKey] = node.NodeID
+		s.usedIPs[node.VirtualIP] = true
+		nodes++
+	}
+	rules := 0
+	if raw, err := s.mirror.Get(ctx, "kronos:acls").Result(); err == nil && raw != "" {
+		var policy models.AclPolicyResponse
+		if err := json.Unmarshal([]byte(raw), &policy); err == nil {
+			s.acls = policy.Rules
+			s.aclVer = policy.Version
+			rules = len(policy.Rules)
+		}
+	}
+	return nodes, rules, nil
 }
 
 func (s *MemoryStore) mirrorAcls() {

@@ -30,14 +30,17 @@ export async function fetchAcls(): Promise<AclPolicyResponse> {
   return getJson<AclPolicyResponse>('/api/v1/acls');
 }
 
-// The control plane gates ACL changes behind KRONOS_ADMIN_TOKEN when one
-// is configured. The operator pastes it once in the ACL panel; it is kept
-// in localStorage and sent as a bearer token on mutations only.
+// The control plane gates ACL changes behind KRONOS_ADMIN_TOKEN. The
+// operator pastes it once per session in the ACL panel; it is kept in
+// sessionStorage - deliberately NOT localStorage: this credential is
+// a bearer secret, and a persistent copy would outlive the session
+// and widen the blast radius of any script that ever runs in this
+// origin. It is sent on mutations only.
 const ADMIN_TOKEN_KEY = 'kronos-admin-token';
 
 export function getAdminToken(): string {
   try {
-    return localStorage.getItem(ADMIN_TOKEN_KEY) ?? '';
+    return sessionStorage.getItem(ADMIN_TOKEN_KEY) ?? '';
   } catch {
     return '';
   }
@@ -46,9 +49,9 @@ export function getAdminToken(): string {
 export function setAdminToken(token: string): void {
   try {
     if (token) {
-      localStorage.setItem(ADMIN_TOKEN_KEY, token);
+      sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
     } else {
-      localStorage.removeItem(ADMIN_TOKEN_KEY);
+      sessionStorage.removeItem(ADMIN_TOKEN_KEY);
     }
   } catch {
     // storage unavailable (private mode); mutations will surface the 401
@@ -101,7 +104,7 @@ const DEMO_NODES: PeerNode[] = [
     public_key: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
     fingerprint: '89eb0d6a8a691dae2cd15ed0369931ce0a949ecafa5c3f93f8121833646e15c3',
     virtual_ip: '100.64.0.10', endpoint: '203.0.113.10:51820', role: 'edge',
-    online: true, nat_type: 'nat', ebpf_enabled: true,
+    online: true, nat_type: 'nat', ebpf_probe_passed: true,
     last_seen: '2026-10-22T00:00:00Z', tx_bytes: 912559104, rx_bytes: 1205866496,
     avg_latency_ms: 11.2,
   },
@@ -110,7 +113,7 @@ const DEMO_NODES: PeerNode[] = [
     public_key: '2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e1fca7e58b2',
     fingerprint: 'cb2f5160fc1f7e05a55ef49d340b48da2e5a78099d53393351cd579dd42503d6',
     virtual_ip: '100.64.0.11', endpoint: '203.0.113.44:51820', role: 'database',
-    online: true, nat_type: 'open', ebpf_enabled: true,
+    online: true, nat_type: 'open', ebpf_probe_passed: true,
     last_seen: '2026-10-22T00:00:00Z', tx_bytes: 402653184, rx_bytes: 536870912,
     avg_latency_ms: 18.6,
   },
@@ -119,7 +122,7 @@ const DEMO_NODES: PeerNode[] = [
     public_key: 'fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9',
     fingerprint: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
     virtual_ip: '100.64.0.12', endpoint: '198.51.100.23:51820', role: 'cache',
-    online: true, nat_type: 'nat', ebpf_enabled: false,
+    online: true, nat_type: 'nat', ebpf_probe_passed: false,
     last_seen: '2026-10-22T00:00:00Z', tx_bytes: 67108864, rx_bytes: 134217728,
     avg_latency_ms: 24.9,
   },
@@ -128,7 +131,7 @@ const DEMO_NODES: PeerNode[] = [
     public_key: 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3',
     fingerprint: '2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e1fca7e58b2',
     virtual_ip: '100.64.0.13', endpoint: '192.0.2.99:51820', role: 'compute',
-    online: true, nat_type: 'nat', ebpf_enabled: true,
+    online: true, nat_type: 'nat', ebpf_probe_passed: true,
     last_seen: '2026-10-22T00:00:00Z', tx_bytes: 2147483648, rx_bytes: 1073741824,
     avg_latency_ms: 21.3,
   },
@@ -137,7 +140,7 @@ const DEMO_NODES: PeerNode[] = [
     public_key: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     fingerprint: 'fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9',
     virtual_ip: '100.64.0.14', endpoint: '198.51.100.77:51820', role: 'iot',
-    online: false, nat_type: 'unknown', ebpf_enabled: false,
+    online: false, nat_type: 'unknown', ebpf_probe_passed: false,
     last_seen: '2026-10-21T22:41:00Z', tx_bytes: 1048576, rx_bytes: 2097152,
     avg_latency_ms: 0,
   },

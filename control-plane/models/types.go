@@ -24,20 +24,20 @@ func Fingerprint(publicKey []byte) string {
 
 // PeerNode is one mesh member as known by the control plane.
 type PeerNode struct {
-	NodeID       string    `json:"node_id"`
-	NodeName     string    `json:"node_name"`
-	PublicKey    string    `json:"public_key"`
-	Fingerprint  string    `json:"fingerprint"`
-	VirtualIP    string    `json:"virtual_ip"`
-	Endpoint     string    `json:"endpoint"`
-	Role         string    `json:"role"`
-	Online       bool      `json:"online"`
-	NATType      string    `json:"nat_type"`
-	EBPFEnabled  bool      `json:"ebpf_enabled"`
-	LastSeen     time.Time `json:"last_seen"`
-	TxBytes      uint64    `json:"tx_bytes"`
-	RxBytes      uint64    `json:"rx_bytes"`
-	AvgLatencyMs float64   `json:"avg_latency_ms"`
+	NodeID          string    `json:"node_id"`
+	NodeName        string    `json:"node_name"`
+	PublicKey       string    `json:"public_key"`
+	Fingerprint     string    `json:"fingerprint"`
+	VirtualIP       string    `json:"virtual_ip"`
+	Endpoint        string    `json:"endpoint"`
+	Role            string    `json:"role"`
+	Online          bool      `json:"online"`
+	NATType         string    `json:"nat_type"`
+	EBPFProbePassed bool      `json:"ebpf_probe_passed"`
+	LastSeen        time.Time `json:"last_seen"`
+	TxBytes         uint64    `json:"tx_bytes"`
+	RxBytes         uint64    `json:"rx_bytes"`
+	AvgLatencyMs    float64   `json:"avg_latency_ms"`
 	// Server-side only: credential hash and heartbeat-reported session
 	// state. Never serialized into API responses.
 	TokenHash        string   `json:"-"`
@@ -46,15 +46,15 @@ type PeerNode struct {
 
 // NodeRegisterRequest is sent by a daemon when it joins the mesh.
 type NodeRegisterRequest struct {
-	NodeName    string `json:"node_name"`
-	PublicKey   string `json:"public_key"`
-	Fingerprint string `json:"fingerprint"`
-	VirtualIP   string `json:"virtual_ip"`
-	Endpoint    string `json:"endpoint"`
-	Role        string `json:"role"`
-	NATType     string `json:"nat_type"`
-	EBPFEnabled bool   `json:"ebpf_enabled"`
-	Version     string `json:"version"`
+	NodeName        string `json:"node_name"`
+	PublicKey       string `json:"public_key"`
+	Fingerprint     string `json:"fingerprint"`
+	VirtualIP       string `json:"virtual_ip"`
+	Endpoint        string `json:"endpoint"`
+	Role            string `json:"role"`
+	NATType         string `json:"nat_type"`
+	EBPFProbePassed bool   `json:"ebpf_probe_passed"`
+	Version         string `json:"version"`
 	// AuthToken carries the node's bearer token from the Authorization
 	// header (handlers fill it; it is never read from the JSON body).
 	AuthToken string `json:"-"`

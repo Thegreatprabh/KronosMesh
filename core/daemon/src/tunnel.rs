@@ -51,6 +51,13 @@ const INIT_MAX_AGE_MS: u64 = 120_000;
 /// two X25519 DH operations before the sender is authenticated, so
 /// unauthenticated floods are capped cheaply, before any DH happens.
 const INIT_RATE_LIMIT: u32 = 30;
+/// The per-source INIT rate table is pruned once it grows past this
+/// many sources, so the guard itself cannot be memory-flooded.
+const INIT_RATE_TABLE_MAX: usize = 4096;
+/// Cap on frames being handled concurrently. The receive loop drops
+/// (and counts) datagrams beyond this instead of spawning unbounded
+/// tasks — a UDP flood must not exhaust memory or the scheduler.
+const MAX_IN_FLIGHT_FRAMES: usize = 256;
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(20);
 const PING_EVERY: Duration = Duration::from_secs(10);
 
@@ -215,6 +222,14 @@ struct FreshnessFile {
     peers: HashMap<String, u64>,
 }
 
+/// Why mesh-data traffic was denied: an explicit DENY rule, or the
+/// default posture when no ALLOW rule matches the source role.
+#[derive(Debug, Clone)]
+pub enum AclDeny {
+    Rule(AclRule),
+    DefaultDeny,
+}
+
 pub struct Tunnel<T: Transport> {
     transport: Arc<T>,
     identity: Arc<Identity>,
@@ -233,6 +248,9 @@ pub struct Tunnel<T: Transport> {
     freshness_file: Mutex<Option<std::path::PathBuf>>,
     /// Per-source INIT rate-limit windows (pre-auth DoS guard).
     init_rate: Mutex<HashMap<SocketAddr, (Instant, u32)>>,
+    /// Bounds concurrent frame handlers (UDP flood guard); acquired in
+    /// the receive loop before a handler task is spawned.
+    frame_permits: Arc<tokio::sync::Semaphore>,
     app_tx: mpsc::Sender<(String, Vec<u8>)>,
     started: Instant,
 }
@@ -303,6 +321,7 @@ impl<T: Transport> Tunnel<T> {
             init_floors: Mutex::new(HashMap::new()),
             freshness_file: Mutex::new(None),
             init_rate: Mutex::new(HashMap::new()),
+            frame_permits: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_FRAMES)),
             app_tx,
             started: Instant::now(),
         });
@@ -512,9 +531,16 @@ impl<T: Transport> Tunnel<T> {
     // whose destination is "*" or "mesh-data" with port 0 (wildcard)
     // govern data-plane traffic; service-specific rules (e.g.
     // edge -> postgres:5432) are enforced by the service gateways that
-    // terminate those services. Rules are evaluated in ascending
-    // priority; the first matching rule decides. A matching DENY drops
-    // the packet, increments telemetry.drops, and logs to the ring.
+    // terminate those services.
+    //
+    // Semantics are DENY-OVERRIDE with a DEFAULT-DENY posture:
+    // * every matching rule is considered — priority never decides the
+    //   outcome (it only picks which DENY rule gets reported);
+    // * any matching DENY drops the traffic, even when an ALLOW with a
+    //   better priority also matches;
+    // * traffic with no matching ALLOW is denied by default, so an
+    //   empty policy passes nothing.
+    // A denial increments telemetry.drops and logs to the ring.
 
     /// Replaces the enforced policy (called by the ACL sync loop).
     pub fn update_acls(&self, rules: &[AclRule]) {
@@ -523,24 +549,39 @@ impl<T: Transport> Tunnel<T> {
             .push(format!("acl: policy updated ({} rules)", rules.len()));
     }
 
-    /// Returns the DENY rule blocking `source_role`'s mesh data, if any.
-    fn acl_denied_for(&self, source_role: &str) -> Option<AclRule> {
+    /// Decides whether mesh data from `source_role` is denied, and why.
+    /// Returns `None` only when a matching ALLOW grants the traffic and
+    /// no matching DENY overrides it.
+    fn acl_denied_for(&self, source_role: &str) -> Option<AclDeny> {
         let rules = self.acl_rules.lock().unwrap();
-        let mut sorted: Vec<&AclRule> = rules.iter().collect();
-        sorted.sort_by_key(|r| r.priority);
-        for rule in sorted {
+        let mut best_deny: Option<&AclRule> = None;
+        let mut allowed = false;
+        for rule in rules.iter() {
             let role_matches = rule.source_role == source_role || rule.source_role == "*";
             let service_matches =
                 rule.dest_service == "*" || rule.dest_service == "mesh-data";
             let port_matches = rule.port == 0;
-            if role_matches && service_matches && port_matches {
-                if rule.action == "DENY" {
-                    return Some(rule.clone());
+            if !(role_matches && service_matches && port_matches) {
+                continue;
+            }
+            if rule.action == "DENY" {
+                // Deny-override: remember the best-priority DENY; an
+                // ALLOW at any priority must never cancel it.
+                if best_deny.is_none_or(|b| rule.priority < b.priority) {
+                    best_deny = Some(rule);
                 }
-                return None; // first match decides; it was an ALLOW
+            } else if rule.action == "ALLOW" {
+                allowed = true;
             }
         }
-        None
+        if let Some(rule) = best_deny {
+            return Some(AclDeny::Rule(rule.clone()));
+        }
+        if allowed {
+            None
+        } else {
+            Some(AclDeny::DefaultDeny)
+        }
     }
 
     // -- sending ---------------------------------------------------------------
@@ -701,12 +742,18 @@ impl<T: Transport> Tunnel<T> {
         ttl: u8,
     ) -> Result<()> {
         if kind == KIND_DATA && src_vip == self.local_vip {
-            if let Some(rule) = self.acl_denied_for(&self.local_role) {
+            if let Some(deny) = self.acl_denied_for(&self.local_role) {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
-                self.ring.push(format!(
-                    "acl: send blocked by DENY rule {} ({} -> {})",
-                    rule.id, rule.source_role, rule.dest_service
-                ));
+                match &deny {
+                    AclDeny::Rule(rule) => self.ring.push(format!(
+                        "acl: send blocked by DENY rule {} ({} -> {})",
+                        rule.id, rule.source_role, rule.dest_service
+                    )),
+                    AclDeny::DefaultDeny => self.ring.push(format!(
+                        "acl: send blocked - no ALLOW rule matches role {} (default deny)",
+                        self.local_role
+                    )),
+                }
                 return Err(anyhow!(
                     "ACL policy denies mesh data for role {}",
                     self.local_role
@@ -777,6 +824,42 @@ impl<T: Transport> Tunnel<T> {
                             .telemetry
                             .userspace_packets
                             .fetch_add(1, Ordering::Relaxed);
+                        // Ingress gate — every check runs BEFORE the
+                        // frame is copied or a task is spawned, so a
+                        // packet flood cannot exhaust memory or the
+                        // scheduler with unbounded per-datagram work:
+                        //  * frames shorter than the smallest header
+                        //    and unknown frame types are dropped;
+                        //  * INIT frames pass the pre-auth rate limit
+                        //    here, not inside the handler;
+                        //  * a bounded semaphore caps concurrent frame
+                        //    handlers; overload drops the datagram
+                        //    (counted) instead of queueing forever.
+                        if n < 8 || !matches!(buf[0], MSG_INIT | MSG_RESP | MSG_DATA) {
+                            recv_self
+                                .telemetry
+                                .drops
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if buf[0] == MSG_INIT && !recv_self.init_rate_ok(from) {
+                            recv_self
+                                .telemetry
+                                .drops
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let permit =
+                            match recv_self.frame_permits.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    recv_self
+                                        .telemetry
+                                        .drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            };
                         // Each frame is handled in its own task: a
                         // handler may need to complete a handshake with
                         // a third node (mesh relay), which requires this
@@ -784,6 +867,7 @@ impl<T: Transport> Tunnel<T> {
                         let handler = recv_self.clone();
                         let frame = buf[..n].to_vec();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             handler.handle_frame(&frame, from).await;
                         });
                     }
@@ -840,6 +924,26 @@ impl<T: Transport> Tunnel<T> {
         }
     }
 
+    /// Pre-auth INIT rate limit: allows INIT_RATE_LIMIT INITs per
+    /// source per second. Enforced in the receive loop BEFORE a
+    /// handler task is spawned, so flood traffic costs no task and no
+    /// frame copy. The per-source table is pruned lazily — once it
+    /// grows past INIT_RATE_TABLE_MAX entries, sources idle for over
+    /// two seconds are evicted, so the table itself stays bounded.
+    fn init_rate_ok(&self, from: SocketAddr) -> bool {
+        let mut rl = self.init_rate.lock().unwrap();
+        if rl.len() > INIT_RATE_TABLE_MAX {
+            let now = Instant::now();
+            rl.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(2));
+        }
+        let e = rl.entry(from).or_insert((Instant::now(), 0));
+        if Instant::now().duration_since(e.0) > Duration::from_secs(1) {
+            *e = (Instant::now(), 0);
+        }
+        e.1 += 1;
+        e.1 <= INIT_RATE_LIMIT
+    }
+
     async fn handle_frame(&self, frame: &[u8], from: SocketAddr) {
         if frame.len() < 8 {
             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -859,23 +963,9 @@ impl<T: Transport> Tunnel<T> {
         if frame.len() < 8 {
             return;
         }
-        // Pre-auth rate limit (see INIT_RATE_LIMIT).
-        {
-            let mut rl = self.init_rate.lock().unwrap();
-            if rl.len() > 4096 {
-                let now = Instant::now();
-                rl.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(2));
-            }
-            let e = rl.entry(from).or_insert((Instant::now(), 0));
-            if Instant::now().duration_since(e.0) > Duration::from_secs(1) {
-                *e = (Instant::now(), 0);
-            }
-            e.1 += 1;
-            if e.1 > INIT_RATE_LIMIT {
-                self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
+        // The pre-auth INIT rate limit is enforced in the receive loop
+        // before this handler is spawned (see init_rate_ok), so flood
+        // traffic is dropped without a task ever being created.
         let sender_index = u32::from_le_bytes(frame[4..8].try_into().unwrap());
         let msg1 = &frame[8..];
         let mut responder = HandshakeResponder::new(self.identity.secret());
@@ -1123,12 +1213,17 @@ impl<T: Transport> Tunnel<T> {
                     .peer_by_vip(&src_vip)
                     .map(|p| p.role.lock().unwrap().clone())
                     .unwrap_or_else(|| peer.role.lock().unwrap().clone());
-                if let Some(rule) = self.acl_denied_for(&src_role) {
+                if let Some(deny) = self.acl_denied_for(&src_role) {
                     self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
-                    self.ring.push(format!(
-                        "acl: packet from role {src_role} dropped by DENY rule {}",
-                        rule.id
-                    ));
+                    match &deny {
+                        AclDeny::Rule(rule) => self.ring.push(format!(
+                            "acl: packet from role {src_role} dropped by DENY rule {}",
+                            rule.id
+                        )),
+                        AclDeny::DefaultDeny => self.ring.push(format!(
+                            "acl: packet from role {src_role} dropped - no ALLOW rule matches (default deny)"
+                        )),
+                    }
                     return;
                 }
                 if dst_vip == self.local_vip {
@@ -1209,6 +1304,17 @@ mod tests {
             ring,
         )
         .unwrap();
+        // The default posture is default-deny: model an operator who
+        // has published an allow-all policy so data tests can flow.
+        // ACL-focused tests override this with update_acls.
+        tunnel.update_acls(&[crate::wire::AclRule {
+            id: "test-allow-all".to_string(),
+            source_role: "*".to_string(),
+            dest_service: "*".to_string(),
+            port: 0,
+            action: "ALLOW".to_string(),
+            priority: 1,
+        }]);
         (tunnel, rx, identity, telemetry)
     }
 
@@ -1621,7 +1727,8 @@ mod tests {
         a.spawn_loops();
         b.spawn_loops();
 
-        // Baseline: without policy, the packet is delivered.
+        // Baseline: make_node seeds an allow-all policy (priority 1),
+        // so the packet is delivered.
         a.send_data("100.64.0.32", b"before policy").await.unwrap();
         let (_src, payload) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
             .await
@@ -1629,15 +1736,29 @@ mod tests {
             .expect("channel closed");
         assert_eq!(payload, b"before policy");
 
-        // Policy lands on B: role "edge" is denied mesh data.
-        b.update_acls(&[AclRule {
-            id: "deny-edge".to_string(),
-            source_role: "edge".to_string(),
-            dest_service: "*".to_string(),
-            port: 0,
-            action: "DENY".to_string(),
-            priority: 1,
-        }]);
+        // Policy lands on B: role "edge" is denied mesh data. The DENY
+        // deliberately carries a WORSE priority (100) than the seeded
+        // ALLOW (1): under the old first-match semantics the ALLOW
+        // would have won and this packet would have been delivered.
+        // Deny-override means the DENY wins anyway.
+        b.update_acls(&[
+            AclRule {
+                id: "test-allow-all".to_string(),
+                source_role: "*".to_string(),
+                dest_service: "*".to_string(),
+                port: 0,
+                action: "ALLOW".to_string(),
+                priority: 1,
+            },
+            AclRule {
+                id: "deny-edge".to_string(),
+                source_role: "edge".to_string(),
+                dest_service: "*".to_string(),
+                port: 0,
+                action: "DENY".to_string(),
+                priority: 100,
+            },
+        ]);
 
         let drops_before = tel_b.snapshot().drops;
         a.send_data("100.64.0.32", b"after policy").await.unwrap();
@@ -1647,5 +1768,122 @@ mod tests {
             tel_b.snapshot().drops > drops_before,
             "drop counter must record the ACL drop"
         );
+    }
+
+    #[tokio::test]
+    async fn acl_default_deny_without_allow_rule() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _tel_a) = make_node(&hub, 6141, "100.64.0.41", "edge").await;
+        let (b, mut rx_b, id_b, tel_b) =
+            make_node(&hub, 6142, "100.64.0.42", "database").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.42", Some(b.local_addr()), "database");
+        b.add_peer(&id_a.public_hex(), "100.64.0.41", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+
+        // Empty policy on both nodes: the default posture denies.
+        a.update_acls(&[]);
+        b.update_acls(&[]);
+
+        // Send side: A refuses to originate traffic with no ALLOW.
+        let res = a.send_data("100.64.0.42", b"no policy").await;
+        assert!(res.is_err(), "send must fail under default deny");
+
+        // Receive side: give A an ALLOW so it can send; B still has an
+        // empty policy and must drop the packet by default.
+        a.update_acls(&[AclRule {
+            id: "allow-edge".to_string(),
+            source_role: "edge".to_string(),
+            dest_service: "*".to_string(),
+            port: 0,
+            action: "ALLOW".to_string(),
+            priority: 1,
+        }]);
+        let drops_before = tel_b.snapshot().drops;
+        a.send_data("100.64.0.42", b"still denied at b").await.unwrap();
+        let blocked = tokio::time::timeout(Duration::from_millis(600), rx_b.recv()).await;
+        assert!(blocked.is_err(), "default-deny packet must not be delivered");
+        assert!(
+            tel_b.snapshot().drops > drops_before,
+            "drop counter must record the default-deny drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_rate_limit_burst_window_and_prune() {
+        let hub = MemoryHub::new();
+        let (a, _rx, _id, _t) = make_node(&hub, 6161, "100.64.0.61", "edge").await;
+        let src = addr(7777);
+        // A full burst up to the limit passes...
+        for _ in 0..INIT_RATE_LIMIT {
+            assert!(a.init_rate_ok(src), "burst up to the limit must pass");
+        }
+        // ...the next INIT inside the same window is refused...
+        assert!(!a.init_rate_ok(src), "over-limit INIT must be refused");
+        // ...other sources are unaffected...
+        assert!(a.init_rate_ok(addr(7778)));
+        // ...and once the window expires the budget resets.
+        {
+            let mut rl = a.init_rate.lock().unwrap();
+            rl.get_mut(&src).unwrap().0 = Instant::now() - Duration::from_secs(2);
+        }
+        assert!(a.init_rate_ok(src), "expired window must reset the budget");
+
+        // Pruning: a table flooded with stale sources is evicted down
+        // when it grows past INIT_RATE_TABLE_MAX.
+        {
+            let mut rl = a.init_rate.lock().unwrap();
+            let old = Instant::now() - Duration::from_secs(10);
+            for i in 0..(INIT_RATE_TABLE_MAX + 100) {
+                rl.insert(addr(10000 + i as u16), (old, 1));
+            }
+        }
+        assert!(a.init_rate_ok(addr(9999)));
+        let len = a.init_rate.lock().unwrap().len();
+        assert!(len < 200, "stale sources must be pruned, table len {len}");
+    }
+
+    #[tokio::test]
+    async fn frame_handler_cap_drops_under_flood() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _tel_a) = make_node(&hub, 6171, "100.64.0.71", "edge").await;
+        let (b, mut rx_b, id_b, tel_b) = make_node(&hub, 6172, "100.64.0.72", "node").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.72", Some(b.local_addr()), "node");
+        b.add_peer(&id_a.public_hex(), "100.64.0.71", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+
+        // Exhaust B's frame-handler permits: B's receive loop must now
+        // DROP incoming frames instead of spawning unbounded tasks.
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_FRAMES {
+            held.push(b.frame_permits.clone().try_acquire_owned().unwrap());
+        }
+        let drops_before = tel_b.snapshot().drops;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            a.send_data("100.64.0.72", b"during flood"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            tel_b.snapshot().drops > drops_before,
+            "overload must be dropped (and counted), not queued"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx_b.recv())
+                .await
+                .is_err(),
+            "nothing may be delivered while the handler cap is exhausted"
+        );
+
+        // Release the pressure: the mesh recovers and traffic flows.
+        drop(held);
+        a.send_data("100.64.0.72", b"after flood").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"after flood");
     }
 }

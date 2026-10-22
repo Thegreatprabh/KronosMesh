@@ -60,7 +60,7 @@ func TestRegisterHeartbeatTopologyFlow(t *testing.T) {
 		"node_name": "edge-01", "public_key": keyHex,
 		"fingerprint": models.Fingerprint(keyBytes),
 		"virtual_ip":  "100.64.0.10", "endpoint": "198.51.100.5:51820",
-		"role": "node", "nat_type": "nat", "ebpf_enabled": false, "version": "1.0.0",
+		"role": "node", "nat_type": "nat", "ebpf_probe_passed": false, "version": "1.0.0",
 	}
 	w, body := doJSON(t, r, http.MethodPost, "/api/v1/nodes/register", regBody)
 	if w.Code != http.StatusOK {
@@ -183,7 +183,7 @@ func TestAdminTokenEnforcement(t *testing.T) {
 		"node_name": "edge-02", "public_key": keyHex,
 		"fingerprint": models.Fingerprint(keyBytes),
 		"virtual_ip":  "100.64.0.11", "endpoint": "198.51.100.6:51820",
-		"role": "node", "nat_type": "nat", "ebpf_enabled": false, "version": "1.0.0",
+		"role": "node", "nat_type": "nat", "ebpf_probe_passed": false, "version": "1.0.0",
 	}
 	// New node without admin token: 401.
 	w, body := doJSON(t, r, http.MethodPost, "/api/v1/nodes/register", regBody)

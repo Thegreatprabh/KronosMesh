@@ -8,7 +8,12 @@
 //	           (e.g. "redis:6379"); the plane works without it.
 //	KRONOS_ADMIN_TOKEN
 //	           operator token gating ACL changes and first-time node
-//	           registrations; strongly recommended outside local dev.
+//	           registrations. REQUIRED (minimum 16 characters): the
+//	           plane refuses to start without one, because an unset
+//	           token would leave operator endpoints open to anyone who
+//	           can reach the port. KRONOS_DEV_OPEN_ADMIN=1 explicitly
+//	           selects the unauthenticated posture for local
+//	           development only.
 //	KRONOS_TLS_CERT / KRONOS_TLS_KEY
 //	           optional PEM paths; when both are set the plane serves
 //	           HTTPS instead of HTTP (point daemons at an https:// URL).
@@ -18,6 +23,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -74,6 +80,13 @@ func main() {
 		port = "8080"
 	}
 	st := store.NewMemoryStore(os.Getenv("REDIS_ADDR"))
+	// Restart recovery: when a Redis mirror exists, rebuild the
+	// registry and ACL policy from it instead of starting empty.
+	if n, a, err := st.RecoverFromMirror(); err != nil {
+		log.Printf("store: mirror recovery failed (%v); starting with empty state", err)
+	} else if n > 0 || a > 0 {
+		log.Printf("store: recovered %d node(s) and %d ACL rule(s) from the Redis mirror", n, a)
+	}
 
 	// Stale-node reaper: nodes that stop heartbeating are marked
 	// offline so the topology and dashboards stay truthful.
@@ -87,9 +100,12 @@ func main() {
 		}
 	}()
 
-	adminToken := os.Getenv("KRONOS_ADMIN_TOKEN")
-	if adminToken == "" {
-		log.Printf("WARNING: KRONOS_ADMIN_TOKEN is not set - ACL changes and new-node registration are unauthenticated (development mode). Node tokens are still enforced for heartbeats and re-registration.")
+	adminToken, devOpen, err := resolveAdminMode(os.Getenv)
+	if err != nil {
+		log.Fatalf("kronos control plane: %v", err)
+	}
+	if devOpen {
+		log.Printf("WARNING: KRONOS_DEV_OPEN_ADMIN=1 - operator authentication is DISABLED (local development only). ACL changes and new-node registration are unauthenticated; node tokens are still enforced for heartbeats and re-registration.")
 	}
 	router := gin.Default()
 	router.Use(corsMiddleware())
@@ -118,6 +134,32 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+// minAdminTokenLen is the shortest operator token accepted outside
+// the explicit development opt-in.
+const minAdminTokenLen = 16
+
+// resolveAdminMode decides the operator-auth posture at startup.
+// Fail-closed by default: without a KRONOS_ADMIN_TOKEN of at least
+// minAdminTokenLen characters the plane refuses to start — an unset
+// token previously just logged a warning and left ACL changes and
+// new-node registration open to anyone who could reach the port.
+// KRONOS_DEV_OPEN_ADMIN=1 is the explicit, greppable opt-in to that
+// open posture for local development.
+func resolveAdminMode(getenv func(string) string) (token string, devOpen bool, err error) {
+	token = getenv("KRONOS_ADMIN_TOKEN")
+	devOpen = getenv("KRONOS_DEV_OPEN_ADMIN") == "1"
+	if token == "" {
+		if devOpen {
+			return "", true, nil
+		}
+		return "", false, fmt.Errorf("KRONOS_ADMIN_TOKEN is not set: operator endpoints (ACL changes, new-node registration) would be unauthenticated. Set a token of at least %d characters, or set KRONOS_DEV_OPEN_ADMIN=1 for local development only", minAdminTokenLen)
+	}
+	if len(token) < minAdminTokenLen && !devOpen {
+		return "", false, fmt.Errorf("KRONOS_ADMIN_TOKEN is too short (%d characters): use at least %d, or set KRONOS_DEV_OPEN_ADMIN=1 for local development only", len(token), minAdminTokenLen)
+	}
+	return token, devOpen, nil
 }
 
 // bodyLimitMiddleware caps request bodies (registrations, heartbeats and

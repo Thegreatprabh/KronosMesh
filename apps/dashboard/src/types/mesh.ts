@@ -12,7 +12,7 @@ export interface PeerNode {
   role: string;
   online: boolean;
   nat_type: string;
-  ebpf_enabled: boolean;
+  ebpf_probe_passed: boolean;
   last_seen: string;
   tx_bytes: number;
   rx_bytes: number;

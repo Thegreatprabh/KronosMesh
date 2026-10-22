@@ -16,7 +16,7 @@ pub struct NodeRegisterRequest {
     pub endpoint: String,
     pub role: String,
     pub nat_type: String,
-    pub ebpf_enabled: bool,
+    pub ebpf_probe_passed: bool,
     pub version: String,
 }
 
@@ -42,7 +42,7 @@ pub struct PeerNode {
     pub role: String,
     pub online: bool,
     pub nat_type: String,
-    pub ebpf_enabled: bool,
+    pub ebpf_probe_passed: bool,
     pub last_seen: String,
     pub tx_bytes: u64,
     pub rx_bytes: u64,

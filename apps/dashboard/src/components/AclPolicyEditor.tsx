@@ -170,6 +170,12 @@ export default function AclPolicyEditor({ policy, roles, readOnly, onCreate, onD
           >
             <Plus size={15} /> {busy ? 'Adding…' : 'Add rule'}
           </button>
+          <p className="mt-2 text-xs text-slate-500">
+            Semantics: a matching DENY always overrides an ALLOW, whatever
+            the priority (priority only orders this list and picks which
+            DENY is reported). Traffic with no matching ALLOW is denied by
+            default.
+          </p>
           {readOnly && (
             <p className="mt-2 text-xs text-amber">
               Demo mode — connect the control plane to edit policy.

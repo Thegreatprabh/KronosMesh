@@ -55,13 +55,13 @@ export default function NodeTable({ nodes, selectedVip, onSelect }: Props) {
                 <td className="py-2.5 pr-3 text-slate-300">{node.role}</td>
                 <td className="py-2.5 pr-3 text-slate-400">{node.nat_type}</td>
                 <td className="py-2.5 pr-3">
-                  {node.ebpf_enabled ? (
+                  {node.ebpf_probe_passed ? (
                     <span className="inline-flex items-center gap-1 rounded bg-mint/10 px-1.5 py-0.5 text-xs text-mint">
-                      <Cpu size={12} /> XDP
+                      <Cpu size={12} /> XDP probe ✓
                     </span>
                   ) : (
                     <span className="rounded bg-slate-500/10 px-1.5 py-0.5 text-xs text-slate-400">
-                      userspace
+                      no XDP probe
                     </span>
                   )}
                 </td>

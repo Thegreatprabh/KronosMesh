@@ -10,7 +10,7 @@
       "role": "node",
       "online": true,
       "nat_type": "nat",
-      "ebpf_enabled": false,
+      "ebpf_probe_passed": false,
       "last_seen": "2026-10-22T00:00:00Z",
       "tx_bytes": 1048576,
       "rx_bytes": 2097152,

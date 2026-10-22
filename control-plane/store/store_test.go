@@ -2,8 +2,11 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
 
 	"github.com/Thegreatprabh/KronosMesh/control-plane/models"
 )
@@ -251,5 +254,99 @@ func TestRegisterRejectsOutOfRangeVirtualIP(t *testing.T) {
 	req.VirtualIP = "8.8.8.8"
 	if _, _, err := s.RegisterNode(req, time.Now().UTC()); err == nil {
 		t.Fatal("out-of-range virtual_ip must be rejected")
+	}
+}
+
+func TestNodeHashRoundTripPreservesState(t *testing.T) {
+	orig := &models.PeerNode{
+		NodeID: "id-1", NodeName: "n1", PublicKey: "ab", Fingerprint: "fp",
+		VirtualIP: "100.64.0.10", Endpoint: "1.2.3.4:51820", Role: "edge",
+		NATType: "nat", EBPFProbePassed: true, Online: true,
+		LastSeen:  time.Date(2026, 10, 22, 4, 0, 0, 0, time.UTC),
+		TokenHash: "deadbeef", TxBytes: 123, RxBytes: 456, AvgLatencyMs: 7.5,
+		EstablishedPeers: []string{"k1", "k2"},
+	}
+	// Simulate the Redis round trip: every hash value becomes a string.
+	fields := map[string]string{}
+	for k, v := range nodeToHash(orig) {
+		fields[k] = fmt.Sprint(v)
+	}
+	back, err := nodeFromHash(orig.NodeID, fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.NodeName != orig.NodeName || back.PublicKey != orig.PublicKey ||
+		back.Fingerprint != orig.Fingerprint || back.VirtualIP != orig.VirtualIP ||
+		back.Endpoint != orig.Endpoint || back.Role != orig.Role ||
+		back.NATType != orig.NATType || back.EBPFProbePassed != orig.EBPFProbePassed ||
+		back.TokenHash != orig.TokenHash || back.TxBytes != orig.TxBytes ||
+		back.RxBytes != orig.RxBytes || back.AvgLatencyMs != orig.AvgLatencyMs ||
+		!back.LastSeen.Equal(orig.LastSeen) || len(back.EstablishedPeers) != 2 {
+		t.Fatalf("round trip lost state:\norig %+v\nback %+v", orig, back)
+	}
+}
+
+// A control-plane restart must not lose the mesh: a fresh store on the
+// same Redis mirror recovers nodes (offline until they heartbeat), the
+// ACL policy with its version, and the credential hashes — so nodes
+// keep their IPs and can authenticate without re-registering.
+func TestRecoveryFromMirrorRestoresMesh(t *testing.T) {
+	mr := miniredis.RunT(t)
+	now := time.Now().UTC()
+
+	s1 := NewMemoryStore(mr.Addr())
+	keyA, bytesA := keyFor("recover-alpha")
+	reqA := testRequest("recover-alpha", keyA)
+	reqA.Fingerprint = models.Fingerprint(bytesA)
+	nodeA, issuedA, err := s1.RegisterNode(reqA, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.CreateAcl(models.AclRule{
+		SourceRole: "edge", DestService: "*", Action: "DENY", Priority: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	versionBefore := s1.ListAcls().Version
+
+	// Restart: a brand-new store against the same Redis.
+	s2 := NewMemoryStore(mr.Addr())
+	nodes, rules, err := s2.RecoverFromMirror()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes != 1 || rules != 1 {
+		t.Fatalf("expected 1 node and 1 rule recovered, got %d and %d", nodes, rules)
+	}
+	list := s2.ListNodes()
+	if len(list) != 1 || list[0].VirtualIP != nodeA.VirtualIP {
+		t.Fatalf("recovered registry wrong: %+v", list)
+	}
+	if list[0].Online {
+		t.Fatal("a recovered node must come back offline until it heartbeats")
+	}
+	// The credential hash survived: the original token still
+	// authenticates a heartbeat, which revives the node.
+	hb := &models.HeartbeatPayload{NodeID: nodeA.NodeID}
+	if _, err := s2.Heartbeat(nodeA.NodeID, hb, issuedA, now.Add(time.Minute)); err != nil {
+		t.Fatalf("heartbeat after recovery must authenticate: %v", err)
+	}
+	if !s2.ListNodes()[0].Online {
+		t.Fatal("heartbeat must mark the recovered node online")
+	}
+	// The allocator must not hand the recovered node's IP to anyone else.
+	keyB, bytesB := keyFor("recover-beta")
+	reqB := testRequest("recover-beta", keyB) // also requests 100.64.0.10
+	reqB.Fingerprint = models.Fingerprint(bytesB)
+	nodeB, _, err := s2.RegisterNode(reqB, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeB.VirtualIP == nodeA.VirtualIP {
+		t.Fatal("allocator reissued a recovered node's IP")
+	}
+	// Policy survived with its version.
+	if got := s2.ListAcls(); len(got.Rules) != 1 || got.Version != versionBefore {
+		t.Fatalf("ACL policy not recovered: %+v", got)
 	}
 }
