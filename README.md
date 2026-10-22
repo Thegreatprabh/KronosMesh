@@ -1,5 +1,7 @@
 # KronosMesh
 
+![KronosMesh mesh animation](assets/mesh-banner.svg)
+
 **Enterprise Zero-Trust Mesh VPN, eBPF Packet Router, and Cryptographic Overlay Network.**
 An open-source alternative to Tailscale and Cloudflare Tunnels — connect servers and computers anywhere in the world into one secure, encrypted, private network, with **no paid third-party cloud dependency**. You run the control plane; your traffic never touches anyone else's infrastructure.
 
@@ -130,7 +132,7 @@ listen_port = 51820
 
 **Control plane.** Gin REST API: node registration with CGNAT-range (`100.64.0.0/10`) virtual-IP assignment, heartbeat telemetry, mesh topology, and versioned ACL policy that daemons sync continuously. Nodes that stop heartbeating are reaped to `offline` after 45 s. The store is in-memory and authoritative; with `REDIS_ADDR` set, writes are mirrored to Redis for external tooling.
 
-**Shared contracts.** One JSON contract (`contracts/` at the repo root) pins the daemon ⇄ control plane ⇄ dashboard payloads. Both the Rust and Go test suites assert their types against those fixtures, so the three codebases cannot silently drift.
+**Shared contracts.** One JSON contract (`contracts/` at the repo root) pins the payloads shared by the daemon, the control plane, and the dashboard. Both the Rust and Go test suites assert their types against those fixtures, so the three codebases cannot silently drift.
 
 ## Repository layout
 
