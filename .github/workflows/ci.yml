@@ -92,3 +92,48 @@ jobs:
           (cd control-plane && go build -o kronos-control-plane .)
       - name: Two-namespace E2E (TUN + ping + mesh DNS + gateway under netem loss)
         run: sudo bash ./scripts/tun-netns-e2e.sh
+
+  cli-e2e:
+    name: cli-e2e
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+      - name: Build control plane + daemon
+        run: |
+          (cd control-plane && go build -o /tmp/kronos-cp .)
+          cargo build --release --manifest-path core/daemon/Cargo.toml
+      - name: CLI end-to-end (bench, up, peers, status against a live control plane)
+        env:
+          KRONOS_ADMIN_TOKEN: ci-admin-token-1234567890
+          KRONOS_NODE_NAME: ci-node
+          KRONOS_CONTROL_URL: http://127.0.0.1:18099
+          KRONOS_CONTROL_TOKEN: ci-admin-token-1234567890
+          KRONOS_ALLOW_INSECURE_HTTP: "1"
+          KRONOS_STATE_DIR: /tmp/kronos-ci-state
+          KRONOS_TUN: "0"
+          KRONOS_LISTEN_PORT: "51999"
+        run: |
+          DAEMON=core/daemon/target/release/kronos-daemon
+          "$DAEMON" --help > /dev/null
+          "$DAEMON" bench | grep -E 'throughput'
+          PORT=18099 /tmp/kronos-cp &
+          CP_PID=$!
+          trap 'kill $CP_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:18099/api/v1/health > /dev/null && break; sleep 1; done
+          "$DAEMON" up &
+          DAEMON_PID=$!
+          trap 'kill $CP_PID $DAEMON_PID 2>/dev/null || true' EXIT
+          ok=0
+          for i in $(seq 1 30); do
+            if "$DAEMON" peers | grep -q 'ci-node'; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "node never appeared in peers"; exit 1; }
+          "$DAEMON" peers
+          "$DAEMON" peers | grep -q 'online'
+          "$DAEMON" status | grep -q 'fingerprint'
+          echo "CLI end-to-end OK"
