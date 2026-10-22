@@ -61,10 +61,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
       - name: Rust dependency audit (cargo audit)
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --file core/daemon/Cargo.lock
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
@@ -91,4 +91,4 @@ jobs:
           cargo build --release --manifest-path core/daemon/Cargo.toml
           (cd control-plane && go build -o kronos-control-plane .)
       - name: Two-namespace E2E (TUN + ping + mesh DNS + gateway under netem loss)
-        run: sudo ./scripts/tun-netns-e2e.sh
+        run: sudo bash ./scripts/tun-netns-e2e.sh
