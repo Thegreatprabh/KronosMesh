@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -135,5 +136,49 @@ func TestAclLifecycleBumpsVersion(t *testing.T) {
 	}
 	if s.DeleteAcl("does-not-exist") {
 		t.Fatal("delete of missing rule must return false")
+	}
+}
+
+// TestAllocatorExhaustionReturnsError proves pool exhaustion surfaces an
+// error instead of hanging: all requests ask for the same virtual IP, so
+// after the first registration every node falls back to the pool cursor.
+// With a two-address pool the fourth registration must fail fast. (The old
+// allocator looped forever here while holding the store mutex.)
+func TestAllocatorExhaustionReturnsError(t *testing.T) {
+	s := NewMemoryStore("")
+	s.poolLast = ipPoolBase + 1 // auto-assign range: exactly 2 addresses
+	now := time.Now().UTC()
+
+	register := func(name string) (*models.PeerNode, error) {
+		key, keyBytes := keyFor(name)
+		req := testRequest(name, key)
+		req.Fingerprint = models.Fingerprint(keyBytes)
+		req.VirtualIP = "100.64.0.10" // same request for every node
+		return s.RegisterNode(req, now)
+	}
+
+	first, err := register("n1")
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	if first.VirtualIP != "100.64.0.10" {
+		t.Fatalf("first node should keep its requested IP, got %s", first.VirtualIP)
+	}
+	second, err := register("n22")
+	if err != nil {
+		t.Fatalf("second register: %v", err)
+	}
+	if second.VirtualIP != "100.64.0.2" {
+		t.Fatalf("second node should get first pool IP, got %s", second.VirtualIP)
+	}
+	third, err := register("n333")
+	if err != nil {
+		t.Fatalf("third register: %v", err)
+	}
+	if third.VirtualIP != "100.64.0.3" {
+		t.Fatalf("third node should get second pool IP, got %s", third.VirtualIP)
+	}
+	if _, err := register("n4444"); !errors.Is(err, ErrIPPoolExhausted) {
+		t.Fatalf("fourth register should fail with ErrIPPoolExhausted, got %v", err)
 	}
 }

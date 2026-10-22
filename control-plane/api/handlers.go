@@ -2,6 +2,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -54,6 +55,10 @@ func (h *Handlers) RegisterNode(c *gin.Context) {
 	}
 	node, err := h.Store.RegisterNode(&req, h.now())
 	if err != nil {
+		if errors.Is(err, store.ErrIPPoolExhausted) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

@@ -171,6 +171,9 @@ struct Peer {
     vip: [u8; 4],
     endpoint: Mutex<Option<SocketAddr>>,
     state: Mutex<PeerState>,
+    /// Highest handshake-init timestamp accepted from this peer so far
+    /// (millis). Enforces strictly increasing INIT freshness.
+    last_init_ms: Mutex<u64>,
     latency_ms: Mutex<f64>,
     last_activity: Mutex<Instant>,
 }
@@ -187,7 +190,7 @@ pub struct Tunnel<T: Transport> {
     ring: Arc<EventRing>,
     acl_rules: Mutex<Vec<AclRule>>,
     local_role: String,
-    index_counter: Mutex<u32>,
+    last_init_ms: Mutex<u64>,
     app_tx: mpsc::Sender<(String, Vec<u8>)>,
     started: Instant,
 }
@@ -254,7 +257,7 @@ impl<T: Transport> Tunnel<T> {
             ring,
             acl_rules: Mutex::new(Vec::new()),
             local_role: local_role.to_string(),
-            index_counter: Mutex::new(1),
+            last_init_ms: Mutex::new(0),
             app_tx,
             started: Instant::now(),
         });
@@ -272,10 +275,30 @@ impl<T: Transport> Tunnel<T> {
     }
 
     fn next_index(&self) -> u32 {
-        let mut guard = self.index_counter.lock().unwrap();
-        let idx = *guard;
-        *guard = guard.wrapping_add(1);
-        idx
+        // Session indices are wire-visible lookup keys; sequential values
+        // are predictable, so draw random ones (as WireGuard does) and
+        // retry on the (astronomically unlikely) collision.
+        use rand_core::RngCore;
+        let by_index = self.by_index.lock().unwrap();
+        loop {
+            let mut b = [0u8; 4];
+            rand_core::OsRng.fill_bytes(&mut b);
+            let idx = u32::from_le_bytes(b);
+            if idx != 0 && !by_index.contains_key(&idx) {
+                return idx;
+            }
+        }
+    }
+
+    /// Monotonically increasing handshake timestamp (millis). The wall
+    /// clock alone can repeat a millisecond or step backwards; responders
+    /// enforce strictly increasing timestamps per peer, so the initiator
+    /// guarantees them even across rapid successive handshakes.
+    fn next_init_ts(&self) -> u64 {
+        let mut last = self.last_init_ms.lock().unwrap();
+        let ts = now_millis().max(*last + 1);
+        *last = ts;
+        ts
     }
 
     // -- peer table -----------------------------------------------------------
@@ -313,6 +336,7 @@ impl<T: Transport> Tunnel<T> {
             vip: octets,
             endpoint: Mutex::new(endpoint),
             state: Mutex::new(PeerState::Idle),
+            last_init_ms: Mutex::new(0),
             latency_ms: Mutex::new(0.0),
             last_activity: Mutex::new(Instant::now()),
         });
@@ -429,11 +453,8 @@ impl<T: Transport> Tunnel<T> {
         let local_index = self.next_index();
         let mut initiator =
             HandshakeInitiator::new(self.identity.secret(), peer.public);
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let msg1 = initiator.write_message1(&now_secs.to_le_bytes())?;
+        let init_ts = self.next_init_ts();
+        let msg1 = initiator.write_message1(&init_ts.to_le_bytes())?;
         self.by_index
             .lock()
             .unwrap()
@@ -645,7 +666,7 @@ impl<T: Transport> Tunnel<T> {
         let sender_index = u32::from_le_bytes(frame[4..8].try_into().unwrap());
         let msg1 = &frame[8..];
         let mut responder = HandshakeResponder::new(self.identity.secret());
-        let (_payload, remote_static) = match responder.read_message1(msg1) {
+        let (payload, remote_static) = match responder.read_message1(msg1) {
             Ok(v) => v,
             Err(e) => {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -666,7 +687,34 @@ impl<T: Transport> Tunnel<T> {
                 }
             }
         };
-        *peer.endpoint.lock().unwrap() = Some(from);
+        // Freshness: the INIT payload is a millisecond timestamp that must
+        // be strictly greater than the last one accepted from this peer. A
+        // captured INIT replayed later is rejected here, so it can no
+        // longer replace the live session or hijack the peer's endpoint.
+        if payload.len() != 8 {
+            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+            self.ring.push("handshake init without timestamp payload".to_string());
+            return;
+        }
+        let init_ts = u64::from_le_bytes(payload[..8].try_into().unwrap());
+        if init_ts > now_millis() + 300_000 {
+            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+            self.ring
+                .push("handshake init timestamp too far in the future".to_string());
+            return;
+        }
+        {
+            let mut last = peer.last_init_ms.lock().unwrap();
+            if init_ts <= *last {
+                self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                self.ring.push(format!(
+                    "stale or replayed handshake init from {} (ts {init_ts} <= last {})",
+                    peer.public_hex, *last
+                ));
+                return;
+            }
+            *last = init_ts;
+        }
         let local_index = self.next_index();
         let (msg2, session) = match responder.write_message2(&[]) {
             Ok(v) => v,
@@ -677,6 +725,11 @@ impl<T: Transport> Tunnel<T> {
         };
         {
             let mut state = peer.state.lock().unwrap();
+            if let PeerState::Established { local_index: old, .. } = &*state {
+                // Retire the replaced session's index so stale frames can
+                // no longer resolve to this peer.
+                self.by_index.lock().unwrap().remove(old);
+            }
             *state = PeerState::Established {
                 session,
                 local_index,
@@ -687,6 +740,10 @@ impl<T: Transport> Tunnel<T> {
             .lock()
             .unwrap()
             .insert(local_index, peer.public_hex.clone());
+        // Endpoint learning happens only here: this INIT authenticated
+        // (Noise_IK verifies the initiator's static key) and passed the
+        // freshness check, so the source address is trustworthy.
+        *peer.endpoint.lock().unwrap() = Some(from);
         self.telemetry.handshakes_completed.fetch_add(1, Ordering::Relaxed);
         *peer.last_activity.lock().unwrap() = Instant::now();
         let mut resp = Vec::with_capacity(12 + msg2.len());
@@ -711,7 +768,6 @@ impl<T: Transport> Tunnel<T> {
                 return;
             }
         };
-        *peer.endpoint.lock().unwrap() = Some(from);
         let msg2 = &frame[12..];
         let mut state = peer.state.lock().unwrap();
         if let PeerState::AwaitingResponse { initiator, local_index } = &mut *state {
@@ -731,6 +787,10 @@ impl<T: Transport> Tunnel<T> {
                             .handshakes_completed
                             .fetch_add(1, Ordering::Relaxed);
                         *peer.last_activity.lock().unwrap() = Instant::now();
+                        // Message 2 authenticated (its AEAD tag covers the
+                        // handshake transcript); only now is the source
+                        // address trusted as the peer's endpoint.
+                        *peer.endpoint.lock().unwrap() = Some(from);
                     }
                     Err(e) => {
                         self.ring.push(format!("handshake completion failed: {e}"));
@@ -754,7 +814,6 @@ impl<T: Transport> Tunnel<T> {
                 return;
             }
         };
-        *peer.endpoint.lock().unwrap() = Some(from);
         let plain = {
             let mut state = peer.state.lock().unwrap();
             match &mut *state {
@@ -772,6 +831,10 @@ impl<T: Transport> Tunnel<T> {
                 }
             }
         };
+        // The packet authenticated and passed the replay window inside
+        // session.open(); only authenticated traffic may teach us the
+        // peer's endpoint (NAT rebinding keeps working, spoofing does not).
+        *peer.endpoint.lock().unwrap() = Some(from);
         *peer.last_activity.lock().unwrap() = Instant::now();
         if plain.len() < 5 {
             return;
@@ -931,6 +994,103 @@ mod tests {
         let res = stranger.send_data("100.64.0.21", b"intruder").await;
         assert!(res.is_err());
         assert_eq!(a.connected_peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn forged_frame_cannot_hijack_endpoint() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6201, "100.64.0.21", "edge").await;
+        let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6202, "100.64.0.22", "db").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.22", Some(b.local_addr()), "db");
+        b.add_peer(&id_a.public_hex(), "100.64.0.21", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        a.send_data("100.64.0.22", b"before attack").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"before attack");
+
+        // B's receiver index for the session with A.
+        let receiver_index = {
+            let peer = {
+                let peers = b.peers.lock().unwrap();
+                peers.get(&id_a.public_hex()).unwrap().clone()
+            };
+            let state = peer.state.lock().unwrap();
+            match &*state {
+                PeerState::Established { local_index, .. } => *local_index,
+                _ => panic!("session not established"),
+            }
+        };
+        // Forged DATA frame: valid index, garbage ciphertext, attacker source.
+        let mut forged = vec![MSG_DATA, 0, 0, 0];
+        forged.extend_from_slice(&receiver_index.to_le_bytes());
+        forged.extend_from_slice(&7u64.to_le_bytes());
+        forged.extend_from_slice(&[0xEE; 48]);
+        b.handle_frame(&forged, addr(9999)).await;
+
+        // The endpoint must NOT have moved to the attacker.
+        {
+            let peer = {
+                let peers = b.peers.lock().unwrap();
+                peers.get(&id_a.public_hex()).unwrap().clone()
+            };
+            let endpoint = *peer.endpoint.lock().unwrap();
+            assert_eq!(endpoint, Some(a.local_addr()));
+        }
+        // And the legitimate path still works.
+        a.send_data("100.64.0.22", b"after attack").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"after attack");
+    }
+
+    #[tokio::test]
+    async fn replayed_init_cannot_replace_live_session() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6211, "100.64.0.31", "edge").await;
+        let (b, mut rx_b, id_b, _t2) = make_node(&hub, 6212, "100.64.0.32", "db").await;
+        a.add_peer(&id_b.public_hex(), "100.64.0.32", Some(b.local_addr()), "db");
+        b.add_peer(&id_a.public_hex(), "100.64.0.31", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        a.send_data("100.64.0.32", b"session one").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"session one");
+
+        // Attacker replays a captured-style INIT: a genuine message 1 from
+        // A's key, but carrying an ancient (already-seen) timestamp.
+        let mut initiator =
+            HandshakeInitiator::new(a.identity.secret(), PublicKey::from(&id_b.secret()));
+        let msg1 = initiator.write_message1(&1u64.to_le_bytes()).unwrap();
+        let mut frame = vec![MSG_INIT, 0, 0, 0];
+        frame.extend_from_slice(&7777u32.to_le_bytes());
+        frame.extend_from_slice(&msg1);
+        b.handle_frame(&frame, addr(9998)).await;
+
+        // B must not have moved A's endpoint to the attacker...
+        {
+            let peer = {
+                let peers = b.peers.lock().unwrap();
+                peers.get(&id_a.public_hex()).unwrap().clone()
+            };
+            let endpoint = *peer.endpoint.lock().unwrap();
+            assert_eq!(endpoint, Some(a.local_addr()));
+        }
+        // ...and the live session must still work.
+        a.send_data("100.64.0.32", b"session still alive").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"session still alive");
     }
 
     #[tokio::test]

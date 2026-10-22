@@ -222,6 +222,17 @@ fn init_state(remote_static: &PublicKey) -> SymmetricState {
     state
 }
 
+/// X25519 with a contributory-behaviour check: rejects low-order peer
+/// public keys whose shared secret would be all zeros (a small-subgroup
+/// attack would otherwise silently weaken the handshake).
+fn dh(secret: &StaticSecret, public: &PublicKey) -> Result<SharedSecret> {
+    let shared = secret.diffie_hellman(public);
+    if !shared.was_contributory() {
+        return Err(anyhow!("non-contributory X25519 output (low-order peer key)"));
+    }
+    Ok(shared)
+}
+
 impl HandshakeInitiator {
     pub fn new(static_secret: StaticSecret, remote_static: PublicKey) -> Self {
         Self {
@@ -238,12 +249,12 @@ impl HandshakeInitiator {
         let mut msg = Vec::with_capacity(32 + 48 + payload.len() + 16);
         msg.extend_from_slice(e_pub.as_bytes());
         self.state.mix_hash(e_pub.as_bytes());
-        let es: SharedSecret = self.ephemeral.diffie_hellman(&self.remote_static);
+        let es = dh(&self.ephemeral, &self.remote_static)?;
         self.state.mix_key(es.as_bytes());
         let s_pub = PublicKey::from(&self.static_secret);
         let enc_s = self.state.encrypt_and_hash(s_pub.as_bytes())?;
         msg.extend_from_slice(&enc_s);
-        let ss: SharedSecret = self.static_secret.diffie_hellman(&self.remote_static);
+        let ss = dh(&self.static_secret, &self.remote_static)?;
         self.state.mix_key(ss.as_bytes());
         let enc_payload = self.state.encrypt_and_hash(payload)?;
         msg.extend_from_slice(&enc_payload);
@@ -258,9 +269,9 @@ impl HandshakeInitiator {
         let e_pub_bytes: [u8; 32] = msg[..32].try_into().unwrap();
         let remote_eph = PublicKey::from(e_pub_bytes);
         self.state.mix_hash(&e_pub_bytes);
-        let ee: SharedSecret = self.ephemeral.diffie_hellman(&remote_eph);
+        let ee = dh(&self.ephemeral, &remote_eph)?;
         self.state.mix_key(ee.as_bytes());
-        let se: SharedSecret = self.static_secret.diffie_hellman(&remote_eph);
+        let se = dh(&self.static_secret, &remote_eph)?;
         self.state.mix_key(se.as_bytes());
         let _payload = self.state.decrypt_and_hash(&msg[32..])?;
         let (k1, k2) = self.state.split();
@@ -288,7 +299,7 @@ impl HandshakeResponder {
         let remote_eph = PublicKey::from(e_pub_bytes);
         self.remote_ephemeral = Some(remote_eph);
         self.state.mix_hash(&e_pub_bytes);
-        let es: SharedSecret = self.static_secret.diffie_hellman(&remote_eph);
+        let es = dh(&self.static_secret, &remote_eph)?;
         self.state.mix_key(es.as_bytes());
         let s_bytes = self.state.decrypt_and_hash(&msg[32..80])?;
         if s_bytes.len() != 32 {
@@ -298,7 +309,7 @@ impl HandshakeResponder {
         s_arr.copy_from_slice(&s_bytes);
         let remote_static = PublicKey::from(s_arr);
         self.remote_static = Some(remote_static);
-        let ss: SharedSecret = self.static_secret.diffie_hellman(&remote_static);
+        let ss = dh(&self.static_secret, &remote_static)?;
         self.state.mix_key(ss.as_bytes());
         let payload = self.state.decrypt_and_hash(&msg[80..])?;
         Ok((payload, remote_static))
@@ -313,9 +324,9 @@ impl HandshakeResponder {
         let mut msg = Vec::with_capacity(32 + payload.len() + 16);
         msg.extend_from_slice(e_pub.as_bytes());
         self.state.mix_hash(e_pub.as_bytes());
-        let ee: SharedSecret = ephemeral.diffie_hellman(&remote_eph);
+        let ee = dh(&ephemeral, &remote_eph)?;
         self.state.mix_key(ee.as_bytes());
-        let se: SharedSecret = ephemeral.diffie_hellman(&remote_static);
+        let se = dh(&ephemeral, &remote_static)?;
         self.state.mix_key(se.as_bytes());
         let enc_payload = self.state.encrypt_and_hash(payload)?;
         msg.extend_from_slice(&enc_payload);
@@ -413,13 +424,18 @@ impl Session {
 
     /// Opens a packet sealed by the peer. Rejects replays and tampering.
     pub fn open(&mut self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        // Authenticate FIRST. Only a packet that passes AEAD verification
+        // may advance the replay window; otherwise a single forged frame
+        // carrying a huge counter would poison the window and permanently
+        // kill the session (every later legitimate counter looks too old).
+        let (cipher, nonce) = Self::cipher(&self.recv_key, counter);
+        let plain = cipher
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &[] })
+            .map_err(|_| anyhow!("packet authentication failed"))?;
         if !self.check_and_mark_replay(counter) {
             return Err(anyhow!("replay or out-of-window counter {counter}"));
         }
-        let (cipher, nonce) = Self::cipher(&self.recv_key, counter);
-        cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &[] })
-            .map_err(|_| anyhow!("packet authentication failed"))
+        Ok(plain)
     }
 
     pub fn send_counter(&self) -> u64 {
@@ -499,6 +515,45 @@ mod tests {
         // responder -> initiator
         let (c2, ct2) = resp_session.seal(b"hello back").unwrap();
         assert_eq!(init_session.open(c2, &ct2).unwrap(), b"hello back");
+    }
+
+    #[test]
+    fn forged_frame_cannot_poison_replay_window() {
+        let resp_static = keypair();
+        let resp_pub = PublicKey::from(&resp_static);
+        let init_static = keypair();
+        let mut initiator = HandshakeInitiator::new(init_static, resp_pub);
+        let msg1 = initiator.write_message1(b"1700000000000").unwrap();
+        let mut responder = HandshakeResponder::new(resp_static);
+        let (_p, _s) = responder.read_message1(&msg1).unwrap();
+        let (msg2, mut resp_session) = responder.write_message2(&[]).unwrap();
+        let mut init_session = initiator.read_message2(&msg2).unwrap();
+
+        let (c0, ct0) = init_session.seal(b"first").unwrap();
+        assert_eq!(resp_session.open(c0, &ct0).unwrap(), b"first");
+
+        // Attacker forges a frame with an astronomical counter and garbage
+        // ciphertext. It must fail authentication WITHOUT touching the
+        // replay window.
+        let forged = vec![0xABu8; ct0.len()];
+        assert!(resp_session.open(1u64 << 63, &forged).is_err());
+
+        // The next legitimate packet (counter 1) must still be accepted.
+        let (c1, ct1) = init_session.seal(b"second").unwrap();
+        assert_eq!(c1, 1);
+        assert_eq!(resp_session.open(c1, &ct1).unwrap(), b"second");
+
+        // And a genuine replay is still rejected.
+        assert!(resp_session.open(c1, &ct1).is_err());
+    }
+
+    #[test]
+    fn low_order_public_key_is_rejected() {
+        // An all-zero public key is a classic low-order point: X25519 with
+        // it produces a non-contributory (all-zero) shared secret.
+        let secret = keypair();
+        let low_order = PublicKey::from([0u8; 32]);
+        assert!(dh(&secret, &low_order).is_err());
     }
 
     #[test]

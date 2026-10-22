@@ -9,6 +9,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -35,26 +36,44 @@ type Store interface {
 
 // MemoryStore is the authoritative in-memory implementation.
 type MemoryStore struct {
-	mu      sync.RWMutex
-	byID    map[string]*models.PeerNode
-	byKey   map[string]string // public key -> node id
-	usedIPs map[string]bool
-	nextIP  uint32 // next candidate host part inside 100.64.0.0/10
-	acls    []models.AclRule
-	aclVer  uint64
-	mirror  *redis.Client // optional write-through mirror, may be nil
+	mu       sync.RWMutex
+	byID     map[string]*models.PeerNode
+	byKey    map[string]string // public key -> node id
+	usedIPs  map[string]bool
+	nextIP   uint32 // next candidate pool offset inside 100.64.0.0/10
+	poolLast uint32 // last assignable pool offset (test seam for exhaustion)
+	acls     []models.AclRule
+	aclVer   uint64
+	mirror   *redis.Client // optional write-through mirror, may be nil
 }
 
-const ipPoolBase = 2 // first assignable: 100.64.0.2
+// CGNAT pool: the full RFC 6598 100.64.0.0/10 block, expressed as offsets
+// from the network address. Offset 0 is the network address and offset 1
+// is reserved, so assignment starts at offset 2 (100.64.0.2) and runs to
+// offset 0x3FFFFE (100.127.255.254) - about 4.19 million addresses.
+const (
+	ipPoolBase    = 2          // first assignable offset: 100.64.0.2
+	ipPoolLast    = 0x003FFFFE // last assignable offset: 100.127.255.254
+	ipPoolNetBase = 0x64400000 // 100.64.0.0 as a uint32
+)
+
+// ErrIPPoolExhausted is returned when every address in the pool is taken.
+var ErrIPPoolExhausted = errors.New("virtual IP pool exhausted")
+
+func formatPoolIP(offset uint32) string {
+	v := ipPoolNetBase + offset
+	return fmt.Sprintf("%d.%d.%d.%d", (v>>24)&0xFF, (v>>16)&0xFF, (v>>8)&0xFF, v&0xFF)
+}
 
 // NewMemoryStore builds an empty store. If redisAddr is non-empty and
 // the server answers a ping within the timeout, writes are mirrored.
 func NewMemoryStore(redisAddr string) *MemoryStore {
 	s := &MemoryStore{
-		byID:    make(map[string]*models.PeerNode),
-		byKey:   make(map[string]string),
-		usedIPs: make(map[string]bool),
-		nextIP:  ipPoolBase,
+		byID:     make(map[string]*models.PeerNode),
+		byKey:    make(map[string]string),
+		usedIPs:  make(map[string]bool),
+		nextIP:   ipPoolBase,
+		poolLast: ipPoolLast,
 	}
 	if redisAddr != "" {
 		client := redis.NewClient(&redis.Options{Addr: redisAddr})
@@ -70,22 +89,28 @@ func NewMemoryStore(redisAddr string) *MemoryStore {
 	return s
 }
 
-func (s *MemoryStore) allocateIP(requested string) string {
+// allocateIP assigns a virtual IP. A requested address that is still free
+// is honored; otherwise the next free address from the pool cursor is
+// used. The cursor only ever moves forward, so allocation always
+// terminates: when the pool is exhausted it returns ErrIPPoolExhausted.
+// (The previous implementation wrapped around a 249-address pool in an
+// unbounded loop while the caller held the store mutex, so 250 colliding
+// registrations froze the entire control plane.)
+func (s *MemoryStore) allocateIP(requested string) (string, error) {
 	if requested != "" && !s.usedIPs[requested] {
 		s.usedIPs[requested] = true
-		return requested
+		return requested, nil
 	}
-	for {
-		candidate := fmt.Sprintf("100.64.0.%d", s.nextIP)
+	for s.nextIP <= s.poolLast && s.usedIPs[formatPoolIP(s.nextIP)] {
 		s.nextIP++
-		if s.nextIP > 250 {
-			s.nextIP = ipPoolBase
-		}
-		if !s.usedIPs[candidate] {
-			s.usedIPs[candidate] = true
-			return candidate
-		}
 	}
+	if s.nextIP > s.poolLast {
+		return "", ErrIPPoolExhausted
+	}
+	ip := formatPoolIP(s.nextIP)
+	s.nextIP++
+	s.usedIPs[ip] = true
+	return ip, nil
 }
 
 // RegisterNode inserts a new node or refreshes an existing one (nodes
@@ -110,12 +135,16 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 		copy := *node
 		return &copy, nil
 	}
+	virtualIP, err := s.allocateIP(req.VirtualIP)
+	if err != nil {
+		return nil, err
+	}
 	node := &models.PeerNode{
 		NodeID:      uuid.NewString(),
 		NodeName:    req.NodeName,
 		PublicKey:   req.PublicKey,
 		Fingerprint: req.Fingerprint,
-		VirtualIP:   s.allocateIP(req.VirtualIP),
+		VirtualIP:   virtualIP,
 		Endpoint:    req.Endpoint,
 		Role:        req.Role,
 		Online:      true,
