@@ -1,0 +1,10 @@
+{
+  "node_id": "3f6f1c2e-0000-4000-8000-000000000001",
+  "tx_bytes": 1048576,
+  "rx_bytes": 2097152,
+  "packets_tx": 8123,
+  "packets_rx": 9102,
+  "peers_connected": 3,
+  "avg_latency_ms": 12.5,
+  "uptime_secs": 3600
+}

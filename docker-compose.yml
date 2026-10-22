@@ -1,0 +1,60 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  control-plane:
+    build: ./control-plane
+    environment:
+      PORT: "8080"
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+
+  dashboard:
+    build: ./apps/dashboard
+    ports:
+      - "5173:80"
+    depends_on:
+      - control-plane
+
+  mesh-node-1:
+    build:
+      context: .
+      dockerfile: core/daemon/Dockerfile
+    environment:
+      KRONOS_NODE_NAME: "edge-01"
+      KRONOS_ROLE: "edge"
+      KRONOS_CONTROL_URL: "http://control-plane:8080"
+      KRONOS_LISTEN_PORT: "51820"
+    ports:
+      - "51820:51820/udp"
+    volumes:
+      - node1-state:/home/kronos/.kronos
+    depends_on:
+      - control-plane
+
+  mesh-node-2:
+    build:
+      context: .
+      dockerfile: core/daemon/Dockerfile
+    environment:
+      KRONOS_NODE_NAME: "edge-02"
+      KRONOS_ROLE: "node"
+      KRONOS_CONTROL_URL: "http://control-plane:8080"
+      KRONOS_LISTEN_PORT: "51820"
+    ports:
+      - "51821:51820/udp"
+    volumes:
+      - node2-state:/home/kronos/.kronos
+    depends_on:
+      - control-plane
+
+volumes:
+  redis-data:
+  node1-state:
+  node2-state:

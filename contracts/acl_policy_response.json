@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "rules": [
+    {"id": "r1", "source_role": "admin", "dest_service": "ssh", "port": 22, "action": "ALLOW", "priority": 10},
+    {"id": "r2", "source_role": "node", "dest_service": "postgres", "port": 5432, "action": "DENY", "priority": 20}
+  ]
+}

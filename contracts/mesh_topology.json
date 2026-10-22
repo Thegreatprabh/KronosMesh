@@ -1,0 +1,24 @@
+{
+  "nodes": [
+    {
+      "node_id": "3f6f1c2e-0000-4000-8000-000000000001",
+      "node_name": "edge-blr-01",
+      "public_key": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "fingerprint": "89eb0d6a8a691dae2cd15ed0369931ce0a949ecafa5c3f93f8121833646e15c3",
+      "virtual_ip": "100.64.0.10",
+      "endpoint": "203.0.113.10:51820",
+      "role": "node",
+      "online": true,
+      "nat_type": "nat",
+      "ebpf_enabled": false,
+      "last_seen": "2026-10-22T00:00:00Z",
+      "tx_bytes": 1048576,
+      "rx_bytes": 2097152,
+      "avg_latency_ms": 12.5
+    }
+  ],
+  "links": [
+    {"a": "100.64.0.10", "b": "100.64.0.11", "latency_ms": 12.5, "encrypted": true}
+  ],
+  "generated_at": "2026-10-22T00:00:00Z"
+}
