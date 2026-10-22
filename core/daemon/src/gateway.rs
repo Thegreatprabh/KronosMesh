@@ -256,10 +256,21 @@ impl<T: Transport> Gateway<T> {
     ) -> AbortHandle {
         let gw = self.clone();
         tokio::spawn(async move {
+            let mut consumer_gone = false;
             while let Some(bytes) = gw.tunnel.next_stream_data(&peer_vip, stream_id).await {
                 if wr.write_all(&bytes).await.is_err() {
+                    consumer_gone = true;
                     break;
                 }
+            }
+            if consumer_gone {
+                // The local endpoint vanished mid-stream. Tell
+                // the peer to tear the stream down now instead of
+                // retransmitting into the void until its state
+                // ages out; the reset also retires our inbound
+                // state, so a later stream can never inherit a
+                // phantom sequence gap from this one.
+                gw.tunnel.reset_stream(&peer_vip, stream_id).await;
             }
             // Half-close: shut down the socket's write side (the
             // local endpoint sees a clean EOF after the last byte),
@@ -807,10 +818,16 @@ mod tests {
         let mut c2 = TcpStream::connect("127.0.0.1:18717").await.unwrap();
         c2.write_all(b"still alive").await.unwrap();
         let mut buf = [0u8; 11];
-        tokio::time::timeout(Duration::from_secs(15), c2.read_exact(&mut buf))
-            .await
-            .expect("post-disconnect echo timed out")
-            .expect("post-disconnect echo failed");
+        match tokio::time::timeout(Duration::from_secs(15), c2.read_exact(&mut buf)).await {
+            Ok(r) => {
+                r.expect("post-disconnect echo failed");
+            }
+            Err(e) => {
+                eprintln!("A streams:\n{}", a.stream_debug_all());
+                eprintln!("B streams:\n{}", b.stream_debug_all());
+                panic!("post-disconnect echo timed out: {e:?}");
+            }
+        }
         assert_eq!(&buf, b"still alive");
     }
 }

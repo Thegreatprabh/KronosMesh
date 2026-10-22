@@ -26,7 +26,7 @@
 # entering network namespaces (setns EPERM) and blocks userspace
 # UDP sends outright, so a two-host test cannot execute there.
 #
-# Usage:  sudo ./scripts/tun-netns-e2e.sh
+# Usage:  sudo bash scripts/tun-netns-e2e.sh
 # Env:    DAEMON_BIN, CP_BIN override binary paths.
 set -euo pipefail
 

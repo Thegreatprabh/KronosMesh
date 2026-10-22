@@ -243,6 +243,9 @@ struct ChaosState {
     dup_pct: u32,
     hold_pct: u32,
     held: Vec<(Vec<u8>, SocketAddr)>,
+    /// Deterministic loss for regression tests: while > 0, the
+    /// next sends are dropped regardless of the random rolls.
+    drop_next: u32,
 }
 
 #[cfg(test)]
@@ -265,6 +268,7 @@ impl ChaosTransport {
             dup_pct,
             hold_pct: 20,
             held: Vec::new(),
+            drop_next: 0,
         }));
         let flush_inner = inner.clone();
         let flush_state = state.clone();
@@ -290,6 +294,27 @@ impl ChaosTransport {
 }
 
 #[cfg(test)]
+impl Clone for ChaosTransport {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ChaosTransport {
+    /// Arms deterministic loss: the next `n` datagrams this
+    /// transport sends are dropped, whatever the random rolls
+    /// say. Used to kill one specific protocol frame (e.g. a
+    /// stream OPEN) on demand.
+    pub fn drop_next_sends(&self, n: u32) {
+        self.state.lock().unwrap().drop_next = n;
+    }
+}
+
+#[cfg(test)]
 impl Transport for ChaosTransport {
     fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr()
@@ -310,16 +335,21 @@ impl Transport for ChaosTransport {
             }
             let act = {
                 let mut st = self.state.lock().unwrap();
-                let roll = xorshift(&mut st.rng) % 100;
-                if roll < st.drop_pct as u64 {
+                if st.drop_next > 0 {
+                    st.drop_next -= 1;
                     Act::Drop
-                } else if roll < (st.drop_pct + st.dup_pct) as u64 {
-                    Act::Dup
-                } else if roll < (st.drop_pct + st.dup_pct + st.hold_pct) as u64 {
-                    st.held.push((buf.to_vec(), addr));
-                    Act::Hold
                 } else {
-                    Act::Send
+                    let roll = xorshift(&mut st.rng) % 100;
+                    if roll < st.drop_pct as u64 {
+                        Act::Drop
+                    } else if roll < (st.drop_pct + st.dup_pct) as u64 {
+                        Act::Dup
+                    } else if roll < (st.drop_pct + st.dup_pct + st.hold_pct) as u64 {
+                        st.held.push((buf.to_vec(), addr));
+                        Act::Hold
+                    } else {
+                        Act::Send
+                    }
                 }
             };
             match act {
@@ -1371,6 +1401,33 @@ impl<T: Transport> Tunnel<T> {
         format!("{out} | {inp}")
     }
 
+    /// Test diagnostics: one line per live stream (both maps).
+    #[cfg(test)]
+    pub fn stream_debug_all(&self) -> String {
+        let mut keys: Vec<(String, u32)> = Vec::new();
+        {
+            let map = self.out_streams.lock().unwrap();
+            for k in map.keys() {
+                keys.push(k.clone());
+            }
+        }
+        {
+            let map = self.in_streams.lock().unwrap();
+            for k in map.keys() {
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
+        }
+        if keys.is_empty() {
+            return "(no streams)".to_string();
+        }
+        keys.iter()
+            .map(|(vip, id)| format!("{vip}#{id}: {}", self.stream_debug(vip, *id)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Whether the peer has acknowledged our CLOSE as fully
     /// delivered (diagnostics and tests).
     pub fn stream_close_acked(&self, dst_vip: &str, stream_id: u32) -> bool {
@@ -1444,7 +1501,7 @@ impl<T: Transport> Tunnel<T> {
             let notified = stream.notify.notified();
             tokio::pin!(notified);
             let _ = notified.as_mut().enable();
-            let mut ack: Option<(u32, bool)> = None;
+            let mut ack: Option<(u32, bool, bool)> = None;
             let step = {
                 let mut st = stream.state.lock().unwrap();
                 if st.dead {
@@ -1453,7 +1510,11 @@ impl<T: Transport> Tunnel<T> {
                     let before = st.next_expected;
                     InStream::drain(&mut st);
                     if st.next_expected != before {
-                        ack = Some((st.next_expected, InStream::close_complete(&st)));
+                        ack = Some((
+                            st.next_expected,
+                            InStream::close_complete(&st),
+                            st.open_emitted,
+                        ));
                     }
                     Pull::Data(front)
                 } else if InStream::close_complete(&st) {
@@ -1463,9 +1524,15 @@ impl<T: Transport> Tunnel<T> {
                     Pull::Wait
                 }
             };
-            if let Some((next_expected, close_complete)) = ack {
-                self.send_stream_ack(src_vip, stream_id, next_expected, close_complete)
-                    .await;
+            if let Some((next_expected, close_complete, open_confirmed)) = ack {
+                self.send_stream_ack(
+                    src_vip,
+                    stream_id,
+                    next_expected,
+                    close_complete,
+                    open_confirmed,
+                )
+                .await;
             }
             match step {
                 Pull::Data(data) => return Some(data),
@@ -1481,12 +1548,23 @@ impl<T: Transport> Tunnel<T> {
         stream_id: u32,
         next_expected: u32,
         close_complete: bool,
+        open_confirmed: bool,
     ) {
         if let Some(octets) = vip_to_octets(dst_vip) {
+            // Flags byte: bit 0 = close complete, bit 1 = open
+            // confirmed. The open bit is what stops the sender
+            // retransmitting OPEN: it is set only once this side
+            // has actually seen the OPEN and handed it to the
+            // gateway. A plain data ACK must never set it — if
+            // the OPEN frame was lost but data got through, the
+            // sender has to keep retransmitting the OPEN, or the
+            // receiver's gateway never learns the stream exists
+            // (it cannot dial the service without the OPEN body).
+            let flags = (close_complete as u8) | ((open_confirmed as u8) << 1);
             let mut body = Vec::with_capacity(9);
             body.extend_from_slice(&stream_id.to_be_bytes());
             body.extend_from_slice(&next_expected.to_be_bytes());
-            body.push(close_complete as u8);
+            body.push(flags);
             let _ = self.send_inner(octets, KIND_STREAM_ACK, &body).await;
         }
     }
@@ -1533,7 +1611,7 @@ impl<T: Transport> Tunnel<T> {
                     match self.stream_tx.try_send(event) {
                         Ok(()) => {
                             stream.state.lock().unwrap().open_emitted = true;
-                            self.send_stream_ack(&src, stream_id, 0, false).await;
+                            self.send_stream_ack(&src, stream_id, 0, false, true).await;
                         }
                         Err(_) => {
                             // The event queue is full: do NOT ack.
@@ -1545,12 +1623,14 @@ impl<T: Transport> Tunnel<T> {
                     }
                 } else {
                     // Duplicate OPEN (our ACK was lost): re-ack with
-                    // the current receive position.
+                    // the current receive position; the open is
+                    // confirmed by definition here (it was emitted
+                    // before, or it would not be a duplicate).
                     let (next_expected, close_complete) = {
                         let st = stream.state.lock().unwrap();
                         (st.next_expected, InStream::close_complete(&st))
                     };
-                    self.send_stream_ack(&src, stream_id, next_expected, close_complete)
+                    self.send_stream_ack(&src, stream_id, next_expected, close_complete, true)
                         .await;
                 }
             }
@@ -1561,7 +1641,7 @@ impl<T: Transport> Tunnel<T> {
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
                 let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
                 let stream = self.in_stream(&src, stream_id);
-                let (next_expected, close_complete) = {
+                let (next_expected, close_complete, open_confirmed) = {
                     let mut st = stream.state.lock().unwrap();
                     st.last_activity = Instant::now();
                     if !st.dead {
@@ -1578,11 +1658,21 @@ impl<T: Transport> Tunnel<T> {
                             InStream::drain(&mut st);
                         }
                     }
-                    (st.next_expected, InStream::close_complete(&st))
+                    (
+                        st.next_expected,
+                        InStream::close_complete(&st),
+                        st.open_emitted,
+                    )
                 };
                 stream.notify.notify_waiters();
-                self.send_stream_ack(&src, stream_id, next_expected, close_complete)
-                    .await;
+                self.send_stream_ack(
+                    &src,
+                    stream_id,
+                    next_expected,
+                    close_complete,
+                    open_confirmed,
+                )
+                .await;
             }
             KIND_STREAM_CLOSE => {
                 if body.len() < 8 {
@@ -1590,26 +1680,40 @@ impl<T: Transport> Tunnel<T> {
                 }
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
                 let final_seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
-                match self.find_in_stream(&src, stream_id) {
-                    Some(stream) => {
-                        let (next_expected, close_complete) = {
-                            let mut st = stream.state.lock().unwrap();
-                            st.last_activity = Instant::now();
-                            let cur = st.close_at.unwrap_or(0);
-                            st.close_at = Some(cur.max(final_seq));
-                            (st.next_expected, InStream::close_complete(&st))
-                        };
-                        stream.notify.notify_waiters();
-                        self.send_stream_ack(&src, stream_id, next_expected, close_complete)
-                            .await;
-                    }
-                    None => {
-                        // No state: the stream never existed here, or
-                        // it finished and was already purged after a
-                        // full delivery. Either way the sender can
-                        // stop retransmitting its CLOSE.
-                        self.send_stream_ack(&src, stream_id, final_seq, true).await;
-                    }
+                {
+                    // Create the state if it does not exist: a
+                    // CLOSE can legitimately overtake its stream's
+                    // DATA on an unreliable transport, and dropping
+                    // the final sequence number here would wedge
+                    // the stream — the data would be delivered but
+                    // end-of-stream never signalled. (The old code
+                    // also acked "close complete" unconditionally
+                    // in this case, telling the sender to stop
+                    // retransmitting a CLOSE whose data had not
+                    // even arrived.) With the state recorded, the
+                    // ack reports the true completion status and
+                    // the sender's retransmissions converge.
+                    let stream = self.in_stream(&src, stream_id);
+                    let (next_expected, close_complete, open_confirmed) = {
+                        let mut st = stream.state.lock().unwrap();
+                        st.last_activity = Instant::now();
+                        let cur = st.close_at.unwrap_or(0);
+                        st.close_at = Some(cur.max(final_seq));
+                        (
+                            st.next_expected,
+                            InStream::close_complete(&st),
+                            st.open_emitted,
+                        )
+                    };
+                    stream.notify.notify_waiters();
+                    self.send_stream_ack(
+                        &src,
+                        stream_id,
+                        next_expected,
+                        close_complete,
+                        open_confirmed,
+                    )
+                    .await;
                 }
             }
             KIND_STREAM_ACK => {
@@ -1618,12 +1722,19 @@ impl<T: Transport> Tunnel<T> {
                 }
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
                 let next_expected = u32::from_be_bytes(body[4..8].try_into().unwrap());
-                let close_complete = body[8] != 0;
+                let flags = body[8];
+                let close_complete = flags & 0x01 != 0;
+                let open_confirmed = flags & 0x02 != 0;
                 if let Some(stream) = self.find_out_stream(&src, stream_id) {
                     {
                         let mut st = stream.state.lock().unwrap();
                         st.last_activity = Instant::now();
-                        st.open_acked = true;
+                        // Only an ACK whose sender has actually seen
+                        // and emitted our OPEN may stop its
+                        // retransmission (see send_stream_ack).
+                        if open_confirmed {
+                            st.open_acked = true;
+                        }
                         st.unacked.retain(|seq, _| *seq >= next_expected);
                         if close_complete && st.close_final.is_some() {
                             st.close_acked = true;
@@ -1684,7 +1795,15 @@ impl<T: Transport> Tunnel<T> {
                 if resend_close {
                     st.close_last_sent = Some(now);
                 }
-                let purge = st.dead || (st.close_acked && st.unacked.is_empty());
+                // A stream may only be purged once its OPEN is
+                // confirmed (or it never had one): if the OPEN
+                // frame was lost but data + CLOSE were acked, the
+                // state must survive so housekeeping keeps
+                // retransmitting the OPEN — otherwise the peer's
+                // gateway never learns the stream exists and the
+                // connection wedges with both sides "done".
+                let open_settled = st.open_body.is_empty() || st.open_acked;
+                let purge = st.dead || (st.close_acked && st.unacked.is_empty() && open_settled);
                 let open_body = if resend_open {
                     Some(st.open_body.clone())
                 } else {
@@ -3147,6 +3266,142 @@ mod tests {
         a.spawn_loops();
         b.spawn_loops();
         (a, b)
+    }
+
+    /// Regression test for the liveness bug CI caught in the
+    /// disconnect test: if a stream's OPEN frame is lost but its
+    /// DATA gets through, the receiver creates stream state and
+    /// ACKs the data — and those data ACKs must NOT silence the
+    /// sender's OPEN retransmission, because without the OPEN
+    /// the receiver's gateway never learns the stream exists (it
+    /// cannot dial the service without the OPEN body) and the
+    /// connection wedges forever. The OPEN is dropped
+    /// deterministically here; the stream must still open,
+    /// deliver and close.
+    #[tokio::test]
+    async fn stream_open_frame_loss_does_not_wedge_the_stream() {
+        let hub = MemoryHub::new();
+        let mk = |port: u16, vip: &'static str, role: &'static str, seed: u64| {
+            let dir = std::env::temp_dir().join(format!(
+                "kronos-open-loss-{}-{}",
+                std::process::id(),
+                vip.replace('.', "-")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let transport = ChaosTransport::wrap(hub.register(addr(port)), seed, 10, 5);
+            let handle = transport.clone();
+            let (tunnel, rx) = Tunnel::bind_with_transport(
+                transport,
+                Identity::load_or_create(&dir).unwrap(),
+                vip,
+                role,
+                Arc::new(TelemetryCounters::default()),
+                Arc::new(EventRing::new(64)),
+            )
+            .unwrap();
+            tunnel.update_acls(&[crate::wire::AclRule {
+                id: "test-allow-all".to_string(),
+                source_role: "*".to_string(),
+                dest_service: "*".to_string(),
+                port: 0,
+                action: "ALLOW".to_string(),
+                priority: 1,
+            }]);
+            let _ = &rx;
+            (tunnel, handle, Identity::load_or_create(&dir).unwrap())
+        };
+        let (a, a_transport, id_a) = mk(6521, "100.64.26.1", "edge", 0xA5A5_1234);
+        let (b, _b_transport, id_b) = mk(6522, "100.64.26.2", "node", 0x5A5A_9876);
+        let mut rx_b = b
+            .take_stream_receiver()
+            .expect("stream receiver must be available once");
+        let a = Arc::new(a);
+        let b = Arc::new(b);
+        // Peer wiring needs both identities: rebuild knowledge
+        // from the tunnels' own identities via a warm-up is not
+        // possible, so fetch fingerprints from the tunnels.
+        a.add_peer(
+            &id_b.public_hex(),
+            "100.64.26.2",
+            Some(b.local_addr()),
+            "node",
+        );
+        b.add_peer(
+            &id_a.public_hex(),
+            "100.64.26.1",
+            Some(a.local_addr()),
+            "edge",
+        );
+        a.spawn_loops();
+        b.spawn_loops();
+
+        // Warm-up stream: establishes the Noise session, so the
+        // next A->B datagram afterwards is the test stream's OPEN.
+        a.send_stream_open("100.64.26.2", 1, "warmup", 9000)
+            .await
+            .unwrap();
+        let warm = tokio::time::timeout(Duration::from_secs(10), rx_b.recv())
+            .await
+            .expect("warm-up open event timed out")
+            .expect("stream event channel closed");
+        assert!(matches!(warm, StreamEvent::Open { stream_id: 1, .. }));
+        a.send_stream_data("100.64.26.2", 1, b"warm").await.unwrap();
+        a.send_stream_close("100.64.26.2", 1).await.unwrap();
+        let mut warm_got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(chunk) = b.next_stream_data("100.64.26.1", 1).await {
+                warm_got.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("warm-up stream timed out");
+        assert_eq!(warm_got, b"warm");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Kill exactly the next A->B datagram: stream 2's OPEN.
+        a_transport.drop_next_sends(1);
+        a.send_stream_open("100.64.26.2", 2, "echo", 9001)
+            .await
+            .unwrap();
+        a.send_stream_data("100.64.26.2", 2, b"still alive")
+            .await
+            .unwrap();
+        a.send_stream_close("100.64.26.2", 2).await.unwrap();
+
+        // The gateway on B must still learn of stream 2 — only
+        // the retransmitted OPEN can tell it — and the payload
+        // must arrive intact and complete.
+        let ev = tokio::time::timeout(Duration::from_secs(15), rx_b.recv())
+            .await
+            .expect(
+                "open event for stream 2 was never emitted:                  a data ACK silenced the OPEN retransmission",
+            )
+            .expect("stream event channel closed");
+        match ev {
+            StreamEvent::Open {
+                stream_id,
+                service,
+                port,
+                ..
+            } => {
+                assert_eq!(stream_id, 2);
+                assert_eq!(service, "echo");
+                assert_eq!(port, 9001);
+            }
+        }
+        let mut got = Vec::new();
+        let delivered = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(chunk) = b.next_stream_data("100.64.26.1", 2).await {
+                got.extend_from_slice(&chunk);
+            }
+        })
+        .await;
+        if delivered.is_err() {
+            eprintln!("A streams:\n{}", a.stream_debug_all());
+            eprintln!("B streams:\n{}", b.stream_debug_all());
+            panic!("stream 2 delivery timed out");
+        }
+        assert_eq!(got, b"still alive");
     }
 
     /// The core reliability claim: 100 KB pushed through a stream
