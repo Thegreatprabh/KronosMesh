@@ -4963,10 +4963,20 @@ mod tests {
         body.extend_from_slice(&vec![0xAA; STREAM_FRAME_PAYLOAD + 1]);
         a.handle_stream_frame(KIND_STREAM_DATA, &[100, 64, 34, 2], "node".to_string(), &body)
             .await;
-        assert!(
-            a.next_stream_data("100.64.34.2", 9).await.is_none(),
-            "oversized payload must not be buffered"
-        );
+        {
+            // White-box: the oversized frame must have been dropped —
+            // nothing buffered, nothing queued for delivery, receive
+            // position unmoved. (A blocking read cannot assert this:
+            // next_stream_data returns only on data or stream end, so
+            // the original version of this test waited forever — the
+            // hang CI caught in both Rust jobs.)
+            let stream = a.in_stream("100.64.34.2", 9);
+            let st = stream.state.lock().unwrap();
+            assert!(
+                st.buffered.is_empty() && st.delivery.is_empty() && st.next_expected == 0,
+                "oversized payload must be dropped, not buffered"
+            );
+        }
         let mut ok = Vec::new();
         ok.extend_from_slice(&9u32.to_be_bytes());
         ok.extend_from_slice(&0u32.to_be_bytes());
