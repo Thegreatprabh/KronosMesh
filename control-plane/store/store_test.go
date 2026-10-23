@@ -290,6 +290,37 @@ func TestNodeHashRoundTripPreservesState(t *testing.T) {
 // same Redis mirror recovers nodes (offline until they heartbeat), the
 // ACL policy with its version, and the credential hashes — so nodes
 // keep their IPs and can authenticate without re-registering.
+// A corrupt mirrored ACL blob must not abort recovery or fail
+// open: nodes still recover, the policy stays empty (daemons
+// read that as default-deny), and the loss is surfaced via the
+// returned rule count — not hidden as "no ACLs configured".
+func TestRecoveryWithCorruptAclBlobKeepsNodesAndDenyAll(t *testing.T) {
+	mr := miniredis.RunT(t)
+	now := time.Now().UTC()
+
+	s1 := NewMemoryStore(mr.Addr())
+	keyA, bytesA := keyFor("corrupt-acl-alpha")
+	reqA := testRequest("corrupt-acl-alpha", keyA)
+	reqA.Fingerprint = models.Fingerprint(bytesA)
+	if _, _, err := s1.RegisterNode(reqA, now); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the mirrored ACL policy directly in Redis.
+	mr.Set("kronos:acls", "{not json")
+
+	s2 := NewMemoryStore(mr.Addr())
+	nodes, rules, err := s2.RecoverFromMirror()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes != 1 {
+		t.Fatalf("nodes must still recover, got %d", nodes)
+	}
+	if rules != 0 || len(s2.ListAcls().Rules) != 0 {
+		t.Fatalf("corrupt ACL blob must recover as empty policy, got %d rules", rules)
+	}
+}
+
 func TestRecoveryFromMirrorRestoresMesh(t *testing.T) {
 	mr := miniredis.RunT(t)
 	now := time.Now().UTC()

@@ -66,6 +66,19 @@ const STREAM_TICK: Duration = Duration::from_millis(50);
 pub const STREAM_DELIVERY_CAP: usize = 32;
 /// How long finished stream state lingers to answer retransmissions.
 const STREAM_LINGER: Duration = Duration::from_secs(15);
+/// A peer that has sent us nothing for this long is treated as
+/// gone. Sessions exchange keepalives every 20 s, so three
+/// minutes of total silence is not a pause — it is a departure,
+/// and the peer's streams are reaped (see stream_housekeeping).
+const PEER_SILENCE_DEAD: Duration = Duration::from_secs(180);
+/// Soft cap on concurrent inbound streams per peer. One stream's
+/// receive state is bounded (window + delivery cap), but the
+/// stream COUNT was not: an authorized peer with a bug — or a
+/// compromised key — could grow daemon memory by opening streams
+/// it never closes. Beyond the cap, new stream ids are refused
+/// with a RESET. (Checked only when a frame would create new
+/// state, so it is a safety valve, not a precise quota.)
+const MAX_IN_STREAMS_PER_PEER: usize = 1024;
 
 const HANDSHAKE_WAIT: Duration = Duration::from_millis(3000);
 /// Hop limit stamped on inner packets; relays decrement it and drop at
@@ -849,14 +862,83 @@ impl<T: Transport> Tunnel<T> {
 
     /// Syncs the peer table from a control-plane peer list (heartbeat
     /// responses / registration). Our own entry is skipped.
+    ///
+    /// Departed peers are removed: a peer that is absent from
+    /// the list AND has been silent past the dead threshold is
+    /// dropped (routes, session indices and stream state
+    /// included), so the table reflects current membership
+    /// instead of growing for the life of the daemon. Two guards
+    /// keep a glitch from doing damage: an empty list removes
+    /// nobody, and a peer that is actively talking to us is
+    /// never removed by a sync.
     pub fn update_peers(&self, peers: &[PeerNode]) {
         let self_hex = self.identity.public_hex();
+        let incoming: std::collections::HashSet<&str> =
+            peers.iter().map(|p| p.public_key.as_str()).collect();
         for p in peers {
             if p.public_key == self_hex {
                 continue;
             }
             let endpoint = p.endpoint.parse::<SocketAddr>().ok();
             self.add_peer(&p.public_key, &p.virtual_ip, endpoint, &p.role);
+        }
+        if peers.is_empty() {
+            return;
+        }
+        let current: Vec<(String, [u8; 4], Duration)> = {
+            let table = self.peers.lock().unwrap();
+            table
+                .values()
+                .map(|peer| {
+                    (
+                        peer.public_hex.clone(),
+                        peer.vip,
+                        peer.last_activity.lock().unwrap().elapsed(),
+                    )
+                })
+                .collect()
+        };
+        for (pubkey, vip_octets, silence) in current {
+            if pubkey == self_hex
+                || incoming.contains(pubkey.as_str())
+                || silence <= PEER_SILENCE_DEAD
+            {
+                continue;
+            }
+            let vip = octets_to_vip(&vip_octets);
+            let stream_ids: Vec<u32> = {
+                let mut ids: Vec<u32> = self
+                    .out_streams
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|(v, _)| v == &vip)
+                    .map(|(_, id)| *id)
+                    .collect();
+                ids.extend(
+                    self.in_streams
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .filter(|(v, _)| v == &vip)
+                        .map(|(_, id)| *id),
+                );
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+            for stream_id in stream_ids {
+                self.apply_reset(&vip, stream_id);
+            }
+            {
+                let mut routes = self.routes.lock().unwrap();
+                if routes.get(&vip_octets).map(|k| k.as_str()) == Some(pubkey.as_str()) {
+                    routes.remove(&vip_octets);
+                }
+            }
+            self.by_index.lock().unwrap().retain(|_, v| v != &pubkey);
+            self.peers.lock().unwrap().remove(&pubkey);
+            self.ring.push(format!("peer removed: {pubkey} ({vip})"));
         }
     }
 
@@ -1609,6 +1691,12 @@ impl<T: Transport> Tunnel<T> {
                 if service.is_empty() {
                     return;
                 }
+                if self.find_in_stream(&src, stream_id).is_none()
+                    && self.in_stream_count_for(&src) >= MAX_IN_STREAMS_PER_PEER
+                {
+                    self.reply_reset(&src, stream_id).await;
+                    return;
+                }
                 let stream = self.in_stream(&src, stream_id);
                 let stream_dead = { stream.state.lock().unwrap().dead };
                 if stream_dead {
@@ -1661,6 +1749,12 @@ impl<T: Transport> Tunnel<T> {
                 }
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
                 let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                if self.find_in_stream(&src, stream_id).is_none()
+                    && self.in_stream_count_for(&src) >= MAX_IN_STREAMS_PER_PEER
+                {
+                    self.reply_reset(&src, stream_id).await;
+                    return;
+                }
                 let stream = self.in_stream(&src, stream_id);
                 let stream_dead = { stream.state.lock().unwrap().dead };
                 if stream_dead {
@@ -1719,6 +1813,12 @@ impl<T: Transport> Tunnel<T> {
                     // even arrived.) With the state recorded, the
                     // ack reports the true completion status and
                     // the sender's retransmissions converge.
+                    if self.find_in_stream(&src, stream_id).is_none()
+                        && self.in_stream_count_for(&src) >= MAX_IN_STREAMS_PER_PEER
+                    {
+                        self.reply_reset(&src, stream_id).await;
+                        return;
+                    }
                     let stream = self.in_stream(&src, stream_id);
                     let stream_dead = { stream.state.lock().unwrap().dead };
                     if stream_dead {
@@ -1783,6 +1883,34 @@ impl<T: Transport> Tunnel<T> {
             }
             _ => {}
         }
+    }
+
+    /// How long ago this peer last sent us any frame, if the
+    /// peer is known. Locks are taken one at a time (routes,
+    /// then peers, then the peer's own lock) per the file's
+    /// lock discipline.
+    fn peer_silence(&self, vip: &str) -> Option<Duration> {
+        let octets = vip_to_octets(vip)?;
+        let pubkey = self.routes.lock().unwrap().get(&octets).cloned()?;
+        let peer = self.peers.lock().unwrap().get(&pubkey).cloned()?;
+        let silence = peer.last_activity.lock().unwrap().elapsed();
+        Some(silence)
+    }
+
+    fn peer_is_dead(&self, vip: &str) -> bool {
+        self.peer_silence(vip)
+            .map(|silence| silence > PEER_SILENCE_DEAD)
+            .unwrap_or(false)
+    }
+
+    /// Concurrent inbound streams currently held for one peer.
+    fn in_stream_count_for(&self, vip: &str) -> usize {
+        self.in_streams
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(v, _)| v == vip)
+            .count()
     }
 
     /// Periodic stream maintenance: retransmit anything
@@ -1850,6 +1978,16 @@ impl<T: Transport> Tunnel<T> {
                 };
                 (open_body, frames, close_body, purge)
             };
+            if !purge && self.peer_is_dead(&dst) {
+                // The peer has been silent far beyond the
+                // keepalive cadence: no ACK or RESET will ever
+                // arrive. Reap the stream locally (tombstone +
+                // drop) so retransmission stops and a sender
+                // blocked on the window wakes with an error
+                // instead of hanging for the life of the daemon.
+                self.apply_reset(&dst, stream_id);
+                continue;
+            }
             if purge {
                 self.out_streams
                     .lock()
@@ -1885,6 +2023,10 @@ impl<T: Transport> Tunnel<T> {
             };
             if purge {
                 self.in_streams.lock().unwrap().remove(&(src, stream_id));
+            } else if self.peer_is_dead(&src) {
+                // Half-open inbound stream of a peer that has
+                // gone silent: reap it like the outbound side.
+                self.apply_reset(&src, stream_id);
             }
         }
         self.stream_tombstones
@@ -3629,6 +3771,161 @@ mod tests {
             .expect("blocked sender was not woken: the lost reset never healed")
             .unwrap();
         assert!(result.is_err(), "send on a reset stream must fail");
+    }
+
+    fn backdate_peer(a: &Tunnel<MemoryTransport>, pubkey: &str) {
+        let peers = a.peers.lock().unwrap();
+        let peer = peers.get(pubkey).expect("peer must exist");
+        let past = Instant::now()
+            .checked_sub(PEER_SILENCE_DEAD + Duration::from_secs(1))
+            .expect("host uptime exceeds the dead threshold");
+        *peer.last_activity.lock().unwrap() = past;
+    }
+
+    fn phantom_identity(tag: &str) -> Identity {
+        let dir =
+            std::env::temp_dir().join(format!("kronos-phantom-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        Identity::load_or_create(&dir).unwrap()
+    }
+
+    /// A peer that dies mid-stream (no CLOSE, no RESET — the
+    /// host is simply gone) must not leave its streams behind:
+    /// housekeeping reaps both directions once the peer has
+    /// been silent past the dead threshold, so retransmission
+    /// stops and blocked senders wake with an error. A live
+    /// peer's streams are untouched.
+    #[tokio::test]
+    async fn streams_of_a_silent_peer_are_reaped_by_housekeeping() {
+        let hub = Arc::new(MemoryHub::new());
+        let (a, _rx, _id_a, _tel) = make_node(&hub, 6621, "100.64.30.1", "edge").await;
+        let b_id = phantom_identity("30-2");
+        let c_id = phantom_identity("30-3");
+        a.add_peer(&b_id.public_hex(), "100.64.30.2", None, "node");
+        a.add_peer(&c_id.public_hex(), "100.64.30.3", None, "node");
+        let out_b = a.out_stream("100.64.30.2", 5);
+        let in_b = a.in_stream("100.64.30.2", 6);
+        let _out_c = a.out_stream("100.64.30.3", 7);
+
+        backdate_peer(&a, &b_id.public_hex());
+        a.stream_housekeeping().await;
+
+        assert!(
+            a.find_out_stream("100.64.30.2", 5).is_none(),
+            "outbound stream of a silent peer must be reaped"
+        );
+        assert!(
+            a.find_in_stream("100.64.30.2", 6).is_none(),
+            "inbound stream of a silent peer must be reaped"
+        );
+        assert!(
+            out_b.state.lock().unwrap().dead,
+            "reaped sender state must be dead (waiters wake)"
+        );
+        assert!(
+            in_b.state.lock().unwrap().dead,
+            "reaped receiver state must be dead"
+        );
+        assert!(
+            a.tombstoned("100.64.30.2", 5),
+            "reaped stream must be tombstoned"
+        );
+        assert!(
+            a.find_out_stream("100.64.30.3", 7).is_some(),
+            "a live peer's stream must not be reaped"
+        );
+    }
+
+    /// Peer-table membership follows the control plane: a peer
+    /// that is absent from the sync list AND silent past the
+    /// dead threshold is removed (routes included); an absent
+    /// but active peer is kept, and an empty sync removes
+    /// nobody.
+    #[tokio::test]
+    async fn update_peers_removes_departed_silent_peers_only() {
+        let hub = Arc::new(MemoryHub::new());
+        let (a, _rx, _id_a, _tel) = make_node(&hub, 6631, "100.64.31.1", "edge").await;
+        let b_id = phantom_identity("31-2");
+        let c_id = phantom_identity("31-3");
+        let d_id = phantom_identity("31-4");
+        a.add_peer(&b_id.public_hex(), "100.64.31.2", None, "node");
+        a.add_peer(&c_id.public_hex(), "100.64.31.3", None, "node");
+        backdate_peer(&a, &b_id.public_hex());
+
+        let node = |id: &Identity, name: &str, vip: &str| PeerNode {
+            node_id: name.to_string(),
+            node_name: name.to_string(),
+            public_key: id.public_hex(),
+            fingerprint: id.fingerprint(),
+            virtual_ip: vip.to_string(),
+            endpoint: String::new(),
+            role: "node".to_string(),
+            online: true,
+            nat_type: String::new(),
+            ebpf_probe_passed: false,
+            last_seen: String::new(),
+            tx_bytes: 0,
+            rx_bytes: 0,
+            avg_latency_ms: 0.0,
+        };
+        a.update_peers(&[node(&d_id, "node-d", "100.64.31.4")]);
+        assert_eq!(
+            a.peer_count(),
+            2,
+            "departed+silent removed, active kept, new added"
+        );
+        assert!(
+            a.peer_silence("100.64.31.2").is_none(),
+            "removed peer's route must be gone"
+        );
+        assert!(
+            a.peer_silence("100.64.31.3").is_some(),
+            "active peer must survive removal"
+        );
+        a.update_peers(&[]);
+        assert_eq!(a.peer_count(), 2, "an empty sync must remove nobody");
+    }
+
+    /// The inbound stream cap is a safety valve: at the limit,
+    /// a frame that would create state for a NEW stream id is
+    /// refused (RESET) instead of growing the map, while frames
+    /// for existing streams keep flowing.
+    #[tokio::test]
+    async fn inbound_stream_cap_refuses_new_streams_beyond_the_limit() {
+        let hub = Arc::new(MemoryHub::new());
+        let (a, _rx, _id_a, _tel) = make_node(&hub, 6641, "100.64.32.1", "edge").await;
+        let b_id = phantom_identity("32-2");
+        a.add_peer(&b_id.public_hex(), "100.64.32.2", None, "node");
+        for id in 0..MAX_IN_STREAMS_PER_PEER as u32 {
+            a.in_stream("100.64.32.2", id);
+        }
+        assert_eq!(
+            a.in_stream_count_for("100.64.32.2"),
+            MAX_IN_STREAMS_PER_PEER
+        );
+        let src = vip_to_octets("100.64.32.2").unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&9999u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(b"x");
+        a.handle_stream_frame(KIND_STREAM_DATA, &src, "node".to_string(), &body)
+            .await;
+        assert!(
+            a.find_in_stream("100.64.32.2", 9999).is_none(),
+            "a new stream beyond the cap must not create state"
+        );
+        // An existing stream still accepts data at the cap.
+        let mut body0 = Vec::new();
+        body0.extend_from_slice(&0u32.to_be_bytes());
+        body0.extend_from_slice(&0u32.to_be_bytes());
+        body0.extend_from_slice(b"y");
+        a.handle_stream_frame(KIND_STREAM_DATA, &src, "node".to_string(), &body0)
+            .await;
+        let got =
+            tokio::time::timeout(Duration::from_secs(5), a.next_stream_data("100.64.32.2", 0))
+                .await
+                .expect("existing stream must keep flowing at the cap");
+        assert_eq!(got.as_deref(), Some(&b"y"[..]));
     }
 
     /// Debug/isolation probe: both directions bulk simultaneously.

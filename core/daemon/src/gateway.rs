@@ -46,8 +46,10 @@
 //!   client that sends a request and half-closes still receives the
 //!   full reply. A RESET is the only immediate teardown.
 //!
-//! Remaining v2 limits, stated plainly: no idle timeout (a stream
-//! lives as long as both TCP endpoints do), and both peers must run
+//! Remaining v2 limits, stated plainly: no idle timeout for
+//! live peers (a stream to a reachable peer lives as long as both
+//! TCP endpoints do; streams of a peer that has gone completely
+//! silent are reaped by tunnel housekeeping), and both peers must run
 //! a daemon with the v2 stream protocol — the frame format changed
 //! (sequence numbers), so v1 and v2 gateways do not interoperate.
 

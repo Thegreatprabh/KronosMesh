@@ -468,6 +468,13 @@ func (s *MemoryStore) RecoverFromMirror() (int, int, error) {
 			s.acls = policy.Rules
 			s.aclVer = policy.Version
 			rules = len(policy.Rules)
+		} else {
+			// A corrupt ACL blob must not pass silently: the
+			// recovered policy stays empty, which the daemons
+			// evaluate as default-deny (fail-closed) — safe,
+			// but the operator needs to know the policy was
+			// lost so they can re-apply it.
+			log.Printf("store: mirrored ACL policy is corrupt and was NOT recovered (mesh runs default-deny until it is re-applied): %v", err)
 		}
 	}
 	return nodes, rules, nil

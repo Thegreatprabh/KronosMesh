@@ -36,9 +36,10 @@ services:
       KRONOS_NODE_NAME: "edge-01"
       KRONOS_ROLE: "edge"
       KRONOS_CONTROL_URL: "http://control-plane:8080"
-      # The plane is reached over the compose-internal bridge only
-      # (its port is not published to the host in this service); the
-      # daemon otherwise refuses to send tokens to non-loopback
+      # The plane is reached over the compose-internal bridge;
+      # its host-published port exists for the dashboard and
+      # operator API access. The daemon otherwise refuses to
+      # send tokens to non-loopback
       # http:// endpoints. If you expose the plane beyond this
       # network, terminate TLS and switch the URL to https://.
       KRONOS_ALLOW_INSECURE_HTTP: "1"
@@ -59,9 +60,10 @@ services:
       KRONOS_NODE_NAME: "edge-02"
       KRONOS_ROLE: "node"
       KRONOS_CONTROL_URL: "http://control-plane:8080"
-      # The plane is reached over the compose-internal bridge only
-      # (its port is not published to the host in this service); the
-      # daemon otherwise refuses to send tokens to non-loopback
+      # The plane is reached over the compose-internal bridge;
+      # its host-published port exists for the dashboard and
+      # operator API access. The daemon otherwise refuses to
+      # send tokens to non-loopback
       # http:// endpoints. If you expose the plane beyond this
       # network, terminate TLS and switch the URL to https://.
       KRONOS_ALLOW_INSECURE_HTTP: "1"
