@@ -148,25 +148,56 @@ async fn run_up(cfg: Config) -> Result<()> {
         ebpf_probe_passed: ebpf_status.probe_passed,
         version: VERSION.to_string(),
     };
-    // Credential for this registration: an operator token from config
-    // wins (provisioning), otherwise the node token saved from our first
-    // registration. The plane rejects re-registrations without one.
-    let register_token = cfg
-        .control_token
-        .clone()
-        .or_else(|| existing.as_ref().and_then(|s| s.node_token.clone()));
-    let registration = match client
-        .register(&register_req, register_token.as_deref())
-        .await
-    {
-        Ok(r) => {
+    // Credentials for this registration, in priority order: the
+    // node token persisted from our first registration is our own
+    // identity credential and wins; the configured control token
+    // is only a provisioning fallback (first boot has no node
+    // token yet, and re-provisioning after a revocation presents
+    // a fresh enrollment/admin token when the persisted one is
+    // dead). The old order — config token first — broke
+    // single-use enrollment: a restarted node re-presented its
+    // spent enrollment token and was rejected.
+    let persisted_token = existing.as_ref().and_then(|s| s.node_token.clone());
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(t) = &persisted_token {
+        candidates.push(t.clone());
+    }
+    if let Some(t) = &cfg.control_token {
+        if !candidates.contains(t) {
+            candidates.push(t.clone());
+        }
+    }
+    let mut registration = None;
+    for (i, token) in candidates.iter().enumerate() {
+        match client.register(&register_req, Some(token)).await {
+            Ok(r) => {
+                registration = Some((r, Some(token.clone())));
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[kronos] registration attempt {} rejected ({e})",
+                    i + 1
+                );
+            }
+        }
+    }
+    if registration.is_none() && candidates.is_empty() {
+        // No credential at all: a single anonymous attempt
+        // (works only against a dev-open control plane).
+        if let Ok(r) = client.register(&register_req, None).await {
+            registration = Some((r, None));
+        }
+    }
+    let registration = match registration {
+        Some((r, presented_token)) => {
             eprintln!(
                 "[kronos] registered with control plane as {} (vip {})",
                 r.node_id, r.assigned_virtual_ip
             );
             // If the plane issued (or rotated) a token, persist it; else
             // keep the one we presented.
-            let effective_token = r.node_token.clone().or(register_token.clone());
+            let effective_token = r.node_token.clone().or(presented_token);
             NodeState {
                 node_id: r.node_id.clone(),
                 virtual_ip: r.assigned_virtual_ip.clone(),
@@ -175,9 +206,9 @@ async fn run_up(cfg: Config) -> Result<()> {
             .save(&cfg.state_dir)?;
             Some((r, effective_token))
         }
-        Err(e) => {
+        None => {
             eprintln!(
-                "[kronos] control plane unreachable or registration rejected ({e}); running peer-to-peer only"
+                "[kronos] control plane unreachable or registration rejected; running peer-to-peer only"
             );
             None
         }
