@@ -381,3 +381,146 @@ func TestRecoveryFromMirrorRestoresMesh(t *testing.T) {
 		t.Fatalf("ACL policy not recovered: %+v", got)
 	}
 }
+
+// Deleting a node is revocation: its token dies with the registry
+// entry (heartbeats become "unknown node"), its key is forgotten so
+// a later registration of the same key is a NEW identity, and its
+// virtual IP returns to the pool.
+func TestDeleteNodeRevokesMembership(t *testing.T) {
+	s := NewMemoryStore("")
+	now := time.Now().UTC()
+	keyA, bytesA := keyFor("revoked-alpha")
+	reqA := testRequest("revoked-alpha", keyA)
+	reqA.Fingerprint = models.Fingerprint(bytesA)
+	nodeA, issuedA, err := s.RegisterNode(reqA, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !s.DeleteNode(nodeA.NodeID) {
+		t.Fatal("deleting a known node must report true")
+	}
+	if s.DeleteNode(nodeA.NodeID) {
+		t.Fatal("deleting an unknown node must report false")
+	}
+	if s.KeyExists(keyA) {
+		t.Fatal("deleted node's key must be forgotten")
+	}
+	hb := &models.HeartbeatPayload{NodeID: nodeA.NodeID}
+	if _, err := s.Heartbeat(nodeA.NodeID, hb, issuedA, now); !errors.Is(err, ErrUnknownNode) {
+		t.Fatalf("heartbeat of a revoked node must fail as unknown node, got %v", err)
+	}
+
+	// The freed VIP (testRequest asks for 100.64.0.10) is reusable.
+	keyB, bytesB := keyFor("revoked-beta")
+	reqB := testRequest("revoked-beta", keyB)
+	reqB.Fingerprint = models.Fingerprint(bytesB)
+	nodeB, _, err := s.RegisterNode(reqB, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeB.VirtualIP != nodeA.VirtualIP {
+		t.Fatalf("freed VIP must be reusable: got %s, want %s", nodeB.VirtualIP, nodeA.VirtualIP)
+	}
+
+	// The same key registering again is a brand-new node identity.
+	nodeA2, _, err := s.RegisterNode(reqA, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeA2.NodeID == nodeA.NodeID {
+		t.Fatal("re-registration after revocation must mint a new node id")
+	}
+}
+
+// Enrollment tokens are single-use: validation does not consume,
+// consumption burns, and a burned or bogus token never validates.
+func TestEnrollmentTokensAreSingleUse(t *testing.T) {
+	s := NewMemoryStore("")
+	s.AddEnrollmentHash(HashToken("enroll-one"))
+
+	if !s.EnrollmentValid("enroll-one") {
+		t.Fatal("seeded enrollment token must validate")
+	}
+	if !s.EnrollmentValid("enroll-one") {
+		t.Fatal("validation alone must not consume the token")
+	}
+	if s.EnrollmentValid("bogus") || s.EnrollmentValid("") {
+		t.Fatal("bogus/empty tokens must not validate")
+	}
+	if !s.ConsumeEnrollment("enroll-one") {
+		t.Fatal("first consume must succeed")
+	}
+	if s.ConsumeEnrollment("enroll-one") {
+		t.Fatal("second consume of the same token must fail (single-use)")
+	}
+	if s.EnrollmentValid("enroll-one") {
+		t.Fatal("consumed token must no longer validate")
+	}
+	if s.ConsumeEnrollment("never-issued") {
+		t.Fatal("consuming an unknown token must fail")
+	}
+
+	// Minted tokens validate exactly once too.
+	minted := s.MintEnrollmentToken()
+	if minted == "" || !s.EnrollmentValid(minted) {
+		t.Fatal("minted token must validate")
+	}
+	if !s.ConsumeEnrollment(minted) || s.ConsumeEnrollment(minted) {
+		t.Fatal("minted token must be consumable exactly once")
+	}
+}
+
+// An enrollment-authorized registration consumes the token only when
+// the store commits the new node: a registration that fails (here,
+// an unauthorized replay after consumption) must not be possible,
+// and the same token cannot enroll a second key.
+func TestEnrollmentRegistrationConsumesOnCommit(t *testing.T) {
+	s := NewMemoryStore("")
+	now := time.Now().UTC()
+	s.AddEnrollmentHash(HashToken("enroll-reg"))
+
+	keyA, bytesA := keyFor("enroll-alpha")
+	reqA := testRequest("enroll-alpha", keyA)
+	reqA.Fingerprint = models.Fingerprint(bytesA)
+	reqA.AuthToken = "enroll-reg"
+	reqA.EnrollmentAuthorized = true
+	if _, _, err := s.RegisterNode(reqA, now); err != nil {
+		t.Fatalf("enrollment registration must succeed: %v", err)
+	}
+	if s.EnrollmentValid("enroll-reg") {
+		t.Fatal("token must be consumed once the registration committed")
+	}
+
+	keyB, bytesB := keyFor("enroll-beta")
+	reqB := testRequest("enroll-beta", keyB)
+	reqB.Fingerprint = models.Fingerprint(bytesB)
+	reqB.AuthToken = "enroll-reg"
+	reqB.EnrollmentAuthorized = true
+	if _, _, err := s.RegisterNode(reqB, now); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("reusing a consumed enrollment token must fail, got %v", err)
+	}
+}
+
+// The outstanding enrollment set is mirrored to Redis: a restart
+// recovers un-consumed tokens and does not resurrect consumed ones.
+func TestRecoveryFromMirrorRestoresEnrollment(t *testing.T) {
+	mr := miniredis.RunT(t)
+	s1 := NewMemoryStore(mr.Addr())
+	s1.AddEnrollmentHash(HashToken("enroll-live"))
+	s1.AddEnrollmentHash(HashToken("enroll-spent"))
+	if !s1.ConsumeEnrollment("enroll-spent") {
+		t.Fatal("consume before restart must succeed")
+	}
+
+	s2 := NewMemoryStore(mr.Addr())
+	if _, _, err := s2.RecoverFromMirror(); err != nil {
+		t.Fatal(err)
+	}
+	if !s2.EnrollmentValid("enroll-live") {
+		t.Fatal("un-consumed enrollment token must survive a restart")
+	}
+	if s2.EnrollmentValid("enroll-spent") {
+		t.Fatal("consumed enrollment token must stay consumed across a restart")
+	}
+}

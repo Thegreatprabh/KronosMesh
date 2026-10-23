@@ -273,3 +273,141 @@ func TestAdminTokenEnforcement(t *testing.T) {
 		t.Fatalf("ACL create with admin: status %d: %s", w.Code, body)
 	}
 }
+
+func regBodyFor(seed byte, name, vip string) map[string]interface{} {
+	keyBytes := make([]byte, 32)
+	for i := range keyBytes {
+		keyBytes[i] = seed + byte(i)
+	}
+	const digits = "0123456789abcdef"
+	keyHex := ""
+	for _, v := range keyBytes {
+		keyHex += string([]byte{digits[v>>4], digits[v&0xf]})
+	}
+	return map[string]interface{}{
+		"node_name": name, "public_key": keyHex,
+		"fingerprint": models.Fingerprint(keyBytes),
+		"virtual_ip":  vip, "endpoint": "198.51.100.9:51820",
+		"role": "node", "nat_type": "nat", "ebpf_probe_passed": false, "version": "1.0.0",
+	}
+}
+
+// TestRevocationFlow pins DELETE /api/v1/nodes/:id: admin-only,
+// 404 for unknown ids, and after revocation the node's token is
+// dead and its key is treated as brand-new (admin required again).
+func TestRevocationFlow(t *testing.T) {
+	r := setupAdminRouter()
+	regBody := regBodyFor(21, "revoke-me", "100.64.0.21")
+	w, body := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regBody, "test-admin-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("register with admin: status %d: %s", w.Code, body)
+	}
+	var regResp models.NodeRegisterResponse
+	if err := json.Unmarshal(body, &regResp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revocation without the admin token: 401.
+	if w, _ := doJSON(t, r, http.MethodDelete, "/api/v1/nodes/"+regResp.NodeID, nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("delete without admin: status %d, want 401", w.Code)
+	}
+	// Unknown id with admin: 404.
+	if w, _ := doJSONToken(t, r, http.MethodDelete, "/api/v1/nodes/does-not-exist", nil, "test-admin-token"); w.Code != http.StatusNotFound {
+		t.Fatalf("delete unknown node: status %d, want 404", w.Code)
+	}
+	// Revoke with admin: 200 {"deleted": id}.
+	w, body = doJSONToken(t, r, http.MethodDelete, "/api/v1/nodes/"+regResp.NodeID, nil, "test-admin-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete with admin: status %d: %s", w.Code, body)
+	}
+	var delResp map[string]string
+	if err := json.Unmarshal(body, &delResp); err != nil || delResp["deleted"] != regResp.NodeID {
+		t.Fatalf("delete response wrong: %s", body)
+	}
+	// The old node token no longer authenticates anything.
+	hbBody := map[string]interface{}{"node_id": regResp.NodeID}
+	if w, _ := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/"+regResp.NodeID+"/heartbeat", hbBody, regResp.NodeToken); w.Code != http.StatusNotFound {
+		t.Fatalf("heartbeat of revoked node: status %d, want 404", w.Code)
+	}
+	// The same key is brand-new now: registering it without admin
+	// is refused, with admin it succeeds under a fresh node id.
+	if w, _ := doJSON(t, r, http.MethodPost, "/api/v1/nodes/register", regBody); w.Code != http.StatusUnauthorized {
+		t.Fatalf("re-register revoked key without admin: status %d, want 401", w.Code)
+	}
+	w, body = doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regBody, "test-admin-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("re-register revoked key with admin: status %d: %s", w.Code, body)
+	}
+	var regResp2 models.NodeRegisterResponse
+	if err := json.Unmarshal(body, &regResp2); err != nil {
+		t.Fatal(err)
+	}
+	if regResp2.NodeID == regResp.NodeID {
+		t.Fatal("re-registration after revocation must mint a new node id")
+	}
+}
+
+// TestEnrollmentTokenRegistration pins the single-use enrollment
+// flow: minting is admin-only, a token registers exactly one new
+// node, reuse and bogus tokens are refused, a failed registration
+// does not burn the token, and the admin path is unaffected.
+func TestEnrollmentTokenRegistration(t *testing.T) {
+	r := setupAdminRouter()
+
+	if w, _ := doJSON(t, r, http.MethodPost, "/api/v1/enrollment-tokens", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("mint without admin: status %d, want 401", w.Code)
+	}
+	w, body := doJSONToken(t, r, http.MethodPost, "/api/v1/enrollment-tokens", nil, "test-admin-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("mint with admin: status %d: %s", w.Code, body)
+	}
+	var mint map[string]string
+	if err := json.Unmarshal(body, &mint); err != nil || mint["token"] == "" {
+		t.Fatalf("mint response wrong: %s", body)
+	}
+	enrollToken := mint["token"]
+
+	// First new key with the enrollment token: 200.
+	regA := regBodyFor(31, "enrolled-a", "100.64.0.31")
+	w, body = doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regA, enrollToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("register with enrollment token: status %d: %s", w.Code, body)
+	}
+	// Same token, another new key: 401 (consumed).
+	regB := regBodyFor(32, "enrolled-b", "100.64.0.32")
+	if w, _ := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regB, enrollToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("reuse of consumed enrollment token: status %d, want 401", w.Code)
+	}
+	// Bogus token: 401.
+	if w, _ := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regB, "bogus-token"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("register with bogus token: status %d, want 401", w.Code)
+	}
+
+	// A failed registration must not burn the token: mint a second
+	// token, fail validation with it (fingerprint mismatch → 400),
+	// then register the same key correctly with the same token.
+	w, body = doJSONToken(t, r, http.MethodPost, "/api/v1/enrollment-tokens", nil, "test-admin-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("second mint: status %d: %s", w.Code, body)
+	}
+	if err := json.Unmarshal(body, &mint); err != nil {
+		t.Fatal(err)
+	}
+	token2 := mint["token"]
+	regC := regBodyFor(33, "enrolled-c", "100.64.0.33")
+	badC := regBodyFor(33, "enrolled-c", "100.64.0.33")
+	badC["fingerprint"] = "deadbeef"
+	if w, _ := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", badC, token2); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid registration with enrollment token: status %d, want 400", w.Code)
+	}
+	w, body = doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regC, token2)
+	if w.Code != http.StatusOK {
+		t.Fatalf("register after failed attempt must still accept the token: status %d: %s", w.Code, body)
+	}
+
+	// The admin path is unaffected.
+	regD := regBodyFor(34, "enrolled-d", "100.64.0.34")
+	if w, _ := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regD, "test-admin-token"); w.Code != http.StatusOK {
+		t.Fatalf("register with admin token: status %d, want 200", w.Code)
+	}
+}

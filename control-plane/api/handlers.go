@@ -66,6 +66,8 @@ func RegisterRoutes(r *gin.Engine, h *Handlers) {
 	v1.GET("/health", h.Health)
 	v1.POST("/nodes/register", h.RegisterNode)
 	v1.POST("/nodes/:id/heartbeat", h.Heartbeat)
+	v1.DELETE("/nodes/:id", h.DeleteNode)
+	v1.POST("/enrollment-tokens", h.CreateEnrollmentToken)
 	v1.GET("/topology", h.GetTopology)
 	v1.GET("/acls", h.ListAcls)
 	v1.POST("/acls", h.CreateAcl)
@@ -103,16 +105,25 @@ func (h *Handlers) RegisterNode(c *gin.Context) {
 		return
 	}
 	admin := h.isAdmin(c)
+	bearer := bearerToken(c)
+	enroll := false
 	if h.AdminToken != "" && !admin && !h.Store.KeyExists(req.PublicKey) {
-		// Operator-provisioned mode: a brand-new public key may only be
-		// registered by the admin. Existing nodes re-register with the
-		// node token they were issued.
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "admin token required to register a new node"})
-		return
+		// Operator-provisioned mode: a brand-new public key may only
+		// be registered by the admin, or with a single-use enrollment
+		// token. The token is only CHECKED here — the store consumes
+		// it at the point the registration commits, so a failed
+		// registration leaves it valid. Existing nodes re-register
+		// with the node token they were issued.
+		enroll = h.Store.EnrollmentValid(bearer)
+		if !enroll {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "admin token or enrollment token required to register a new node"})
+			return
+		}
 	}
 	req.AdminOverride = admin
+	req.EnrollmentAuthorized = enroll
 	if !admin {
-		req.AuthToken = bearerToken(c)
+		req.AuthToken = bearer
 	}
 	node, issued, err := h.Store.RegisterNode(&req, h.now())
 	if err != nil {
@@ -133,6 +144,34 @@ func (h *Handlers) RegisterNode(c *gin.Context) {
 		Peers:             h.Store.ListNodes(),
 		NodeToken:         issued,
 	})
+}
+
+// DeleteNode handles DELETE /api/v1/nodes/:id — operator revocation
+// of a node's membership. Admin-only. The node's token stops working
+// immediately and its virtual IP returns to the pool.
+func (h *Handlers) DeleteNode(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+	id := c.Param("id")
+	if !h.Store.DeleteNode(id) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": id})
+}
+
+// CreateEnrollmentToken handles POST /api/v1/enrollment-tokens.
+// Admin-only. It mints a single-use enrollment token: the plaintext
+// is returned in this response and never stored or shown again
+// (the store keeps only its SHA-256 hash). Hand it to one new node
+// as its registration credential; it is consumed when that node's
+// registration commits.
+func (h *Handlers) CreateEnrollmentToken(c *gin.Context) {
+	if !h.requireAdmin(c) {
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"token": h.Store.MintEnrollmentToken()})
 }
 
 // Heartbeat handles POST /api/v1/nodes/:id/heartbeat.

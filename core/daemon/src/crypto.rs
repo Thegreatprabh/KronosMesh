@@ -2,7 +2,7 @@
 //! BLAKE2s) implemented from the Noise Protocol Framework specification,
 //! plus the transport session with replay protection.
 //!
-//! Protocol name: Noise_IK_25519_ChaChaPoly_Blake2s
+//! Protocol name: Noise_IK_25519_ChaChaPoly_BLAKE2s
 //!   IK pattern:  -> e, es, s, ss
 //!                <- e, ee, se
 //! The initiator must know the responder's static public key in advance
@@ -17,7 +17,13 @@ use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 pub const HASH_LEN: usize = 32;
 const BLOCK_LEN: usize = 64; // BLAKE2s block size
-const PROTOCOL_NAME: &str = "Noise_IK_25519_ChaChaPoly_Blake2s";
+/// The protocol name is part of the handshake hash: it must be
+/// the Noise specification's exact string ("BLAKE2s", all caps).
+/// An earlier build used "Blake2s", which produced a private,
+/// spec-incompatible handshake variant — every peer must run the
+/// corrected name, so this is a hard interop break with pre-fix
+/// builds by design.
+const PROTOCOL_NAME: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 // ---------------------------------------------------------------------------
 // hex helpers
@@ -65,6 +71,16 @@ fn hash256(data: &[u8]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 pub fn hmac_blake2s(key: &[u8], data: &[u8]) -> [u8; 32] {
+    // Why hand-rolled: Noise mandates BLAKE2s as its hash, and
+    // the audited `hmac`/`hkdf` crates cannot be instantiated
+    // over it — blake2 0.10's core is a variable-output (Lazy
+    // buffer) wrapper and `Hmac<D>`/`Hkdf<D>` require an Eager
+    // buffer digest (verified experimentally; the combination
+    // does not compile). This construction is RFC 2104 verbatim
+    // and its outputs are pinned by reference vectors below
+    // (cross-checked against Python hashlib/hmac). The cookie
+    // mechanism in tunnel.rs — a component with a free choice of
+    // hash — does use the `hmac` crate (over SHA-256).
     let mut key_block = [0u8; BLOCK_LEN];
     if key.len() > BLOCK_LEN {
         let hashed = hash256(key);
@@ -92,6 +108,9 @@ pub fn hmac_blake2s(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 pub fn hkdf_blake2s(salt: &[u8], ikm: &[u8], info: &[u8], okm_len: usize) -> Vec<u8> {
+    // RFC 5869 verbatim over hmac_blake2s (see its comment for
+    // why the `hkdf` crate cannot be used over BLAKE2s here).
+    // Output is pinned by the reference-vector test below.
     let zero_salt = [0u8; 32];
     let salt = if salt.is_empty() { &zero_salt } else { salt };
     let prk = hmac_blake2s(salt, ikm);
@@ -120,6 +139,18 @@ struct SymmetricState {
     h: [u8; 32],
     k: Option<[u8; 32]>,
     n: u64,
+}
+
+impl Drop for SymmetricState {
+    fn drop(&mut self) {
+        // The chaining key (and the handshake cipher key, once
+        // mixed) are secrets; the hash `h` is public transcript.
+        use zeroize::Zeroize;
+        self.ck.zeroize();
+        if let Some(k) = &mut self.k {
+            k.zeroize();
+        }
+    }
 }
 
 impl SymmetricState {
@@ -369,12 +400,23 @@ impl Session {
         (ChaCha20Poly1305::new(Key::from_slice(key)), nonce)
     }
 
-    /// Seals a packet; returns (counter, ciphertext).
-    pub fn seal(&mut self, plaintext: &[u8]) -> Result<(u64, Vec<u8>)> {
+    /// The counter the next seal will use. The caller needs it
+    /// before sealing to build the frame header that becomes the
+    /// AEAD associated data.
+    pub fn next_counter(&self) -> u64 {
+        self.send_counter
+    }
+
+    /// Seals a packet; returns (counter, ciphertext). `aad` binds
+    /// the ciphertext to its frame context (the caller passes the
+    /// full frame header: type + indices + counter), so a frame
+    /// cannot be transplanted into another session, direction or
+    /// frame type and still authenticate.
+    pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<(u64, Vec<u8>)> {
         let counter = self.send_counter;
         let (cipher, nonce) = Self::cipher(&self.send_key, counter);
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: &[] })
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
             .map_err(|_| anyhow!("packet seal failed"))?;
         self.send_counter += 1;
         Ok((counter, ct))
@@ -423,14 +465,14 @@ impl Session {
     }
 
     /// Opens a packet sealed by the peer. Rejects replays and tampering.
-    pub fn open(&mut self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    pub fn open(&mut self, counter: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
         // Authenticate FIRST. Only a packet that passes AEAD verification
         // may advance the replay window; otherwise a single forged frame
         // carrying a huge counter would poison the window and permanently
         // kill the session (every later legitimate counter looks too old).
         let (cipher, nonce) = Self::cipher(&self.recv_key, counter);
         let plain = cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &[] })
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad })
             .map_err(|_| anyhow!("packet authentication failed"))?;
         if !self.check_and_mark_replay(counter) {
             return Err(anyhow!("replay or out-of-window counter {counter}"));
@@ -441,6 +483,81 @@ impl Session {
     pub fn send_counter(&self) -> u64 {
         self.send_counter
     }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Transport keys are the crown jewels of the data plane;
+        // wipe them when a session dies instead of leaving them in
+        // freed heap for the process's lifetime.
+        use zeroize::Zeroize;
+        self.send_key.zeroize();
+        self.recv_key.zeroize();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end payload protection (origin -> destination)
+// ---------------------------------------------------------------------------
+//
+// Hop sessions authenticate each LINK, but a relay terminates its
+// incoming session and originates the next one — so without a
+// second layer the relay reads (and can rewrite) every payload,
+// and a packet's claimed source is only as honest as the last
+// relay. This layer seals the payload between the ORIGIN and the
+// DESTINATION with a pairwise key derived from their static
+// X25519 keys (both are public in the peer registry). The relay
+// forwards the sealed body opaquely: it can route on the inner
+// header (kind/src/dst/ttl, protected hop-by-hop) but cannot read
+// or forge the body, and the destination's successful open is
+// cryptographic proof that the claimed origin really sent it —
+// ACL decisions keyed on the source are only made after this
+// check passes.
+
+/// Derives the pairwise end-to-end key between two nodes.
+pub fn e2e_key(my_secret: &StaticSecret, their_public: &PublicKey) -> Result<[u8; 32]> {
+    let shared = dh(my_secret, their_public)?;
+    let okm = hkdf_blake2s(b"kronos-e2e-v1", shared.as_bytes(), &[], 32);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&okm);
+    Ok(key)
+}
+
+/// Seals `plaintext` for the destination. Output: nonce(12) ||
+/// ciphertext. src/dst are bound as associated data, so a sealed
+/// body cannot be re-addressed to another pair.
+pub fn e2e_seal(key: &[u8; 32], src: &[u8; 4], dst: &[u8; 4], plaintext: &[u8]) -> Result<Vec<u8>> {
+    use rand_core::RngCore;
+    let mut nonce = [0u8; 12];
+    rand_core::OsRng.fill_bytes(&mut nonce);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut aad = Vec::with_capacity(8);
+    aad.extend_from_slice(src);
+    aad.extend_from_slice(dst);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
+        .map_err(|_| anyhow!("end-to-end seal failed"))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Opens a body sealed by the claimed origin. Failure means the
+/// claimed origin did not send this (wrong pairwise key) or the
+/// body was tampered with — callers MUST drop the packet.
+pub fn e2e_open(key: &[u8; 32], src: &[u8; 4], dst: &[u8; 4], data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 12 + 16 {
+        return Err(anyhow!("end-to-end body too short"));
+    }
+    let (nonce, ct) = data.split_at(12);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut aad = Vec::with_capacity(8);
+    aad.extend_from_slice(src);
+    aad.extend_from_slice(dst);
+    cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+        .map_err(|_| anyhow!("end-to-end authentication failed"))
 }
 
 #[cfg(test)]
@@ -510,11 +627,11 @@ mod tests {
         let mut init_session = initiator.read_message2(&msg2).unwrap();
 
         // initiator -> responder
-        let (c, ct) = init_session.seal(b"hello mesh").unwrap();
-        assert_eq!(resp_session.open(c, &ct).unwrap(), b"hello mesh");
+        let (c, ct) = init_session.seal(b"hdr-a", b"hello mesh").unwrap();
+        assert_eq!(resp_session.open(c, b"hdr-a", &ct).unwrap(), b"hello mesh");
         // responder -> initiator
-        let (c2, ct2) = resp_session.seal(b"hello back").unwrap();
-        assert_eq!(init_session.open(c2, &ct2).unwrap(), b"hello back");
+        let (c2, ct2) = resp_session.seal(b"hdr-b", b"hello back").unwrap();
+        assert_eq!(init_session.open(c2, b"hdr-b", &ct2).unwrap(), b"hello back");
     }
 
     #[test]
@@ -529,22 +646,66 @@ mod tests {
         let (msg2, mut resp_session) = responder.write_message2(&[]).unwrap();
         let mut init_session = initiator.read_message2(&msg2).unwrap();
 
-        let (c0, ct0) = init_session.seal(b"first").unwrap();
-        assert_eq!(resp_session.open(c0, &ct0).unwrap(), b"first");
+        let (c0, ct0) = init_session.seal(b"h", b"first").unwrap();
+        assert_eq!(resp_session.open(c0, b"h", &ct0).unwrap(), b"first");
 
         // Attacker forges a frame with an astronomical counter and garbage
         // ciphertext. It must fail authentication WITHOUT touching the
         // replay window.
         let forged = vec![0xABu8; ct0.len()];
-        assert!(resp_session.open(1u64 << 63, &forged).is_err());
+        assert!(resp_session.open(1u64 << 63, b"h", &forged).is_err());
 
         // The next legitimate packet (counter 1) must still be accepted.
-        let (c1, ct1) = init_session.seal(b"second").unwrap();
+        let (c1, ct1) = init_session.seal(b"h", b"second").unwrap();
         assert_eq!(c1, 1);
-        assert_eq!(resp_session.open(c1, &ct1).unwrap(), b"second");
+        assert_eq!(resp_session.open(c1, b"h", &ct1).unwrap(), b"second");
 
         // And a genuine replay is still rejected.
-        assert!(resp_session.open(c1, &ct1).is_err());
+        assert!(resp_session.open(c1, b"h", &ct1).is_err());
+    }
+
+    #[test]
+    fn protocol_name_is_the_noise_spec_string() {
+        // The name feeds the handshake hash; "BLAKE2s" is the
+        // spec's exact spelling (an earlier build used "Blake2s"
+        // and silently spoke a private dialect).
+        assert_eq!(PROTOCOL_NAME, "Noise_IK_25519_ChaChaPoly_BLAKE2s");
+    }
+
+    #[test]
+    fn transport_frame_is_bound_to_its_header_aad() {
+        let mut a = Session::new([9u8; 32], [9u8; 32], true);
+        let mut b = Session::new([9u8; 32], [9u8; 32], false);
+        let (c, ct) = a.seal(b"header-for-peer-7", b"payload").unwrap();
+        // Same ciphertext, different frame context: must fail.
+        assert!(b.open(c, b"header-for-peer-8", &ct).is_err());
+        assert_eq!(b.open(c, b"header-for-peer-7", &ct).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn e2e_layer_authenticates_the_origin() {
+        let alice = keypair();
+        let bob = keypair();
+        let mallory = keypair();
+        let alice_pub = PublicKey::from(&alice);
+        let bob_pub = PublicKey::from(&bob);
+        let src = [100, 64, 0, 1];
+        let dst = [100, 64, 0, 2];
+        let k_ab = e2e_key(&alice, &bob_pub).unwrap();
+        let sealed = e2e_seal(&k_ab, &src, &dst, b"secret for bob").unwrap();
+        // Bob derives the same pairwise key and opens it.
+        let k_ba = e2e_key(&bob, &alice_pub).unwrap();
+        assert_eq!(k_ab, k_ba);
+        assert_eq!(e2e_open(&k_ba, &src, &dst, &sealed).unwrap(), b"secret for bob");
+        // Mallory claiming Alice's VIP cannot produce a body Bob
+        // accepts: her pairwise key with Bob differs.
+        let k_mb = e2e_key(&mallory, &bob_pub).unwrap();
+        let forged = e2e_seal(&k_mb, &src, &dst, b"forged").unwrap();
+        assert!(e2e_open(&k_ba, &src, &dst, &forged).is_err());
+        // And a relay that flips a bit is caught.
+        let mut tampered = sealed.clone();
+        tampered[20] ^= 1;
+        assert!(e2e_open(&k_ba, &src, &dst, &tampered).is_err());
     }
 
     #[test]
@@ -579,9 +740,9 @@ mod tests {
         responder.read_message1(&msg1).unwrap();
         let (msg2, mut resp_session) = responder.write_message2(&[]).unwrap();
         let mut init_session = initiator.read_message2(&msg2).unwrap();
-        let (c, ct) = init_session.seal(b"once").unwrap();
-        assert!(resp_session.open(c, &ct).is_ok());
-        assert!(resp_session.open(c, &ct).is_err());
+        let (c, ct) = init_session.seal(b"h", b"once").unwrap();
+        assert!(resp_session.open(c, b"h", &ct).is_ok());
+        assert!(resp_session.open(c, b"h", &ct).is_err());
     }
 
     #[test]
@@ -590,8 +751,8 @@ mod tests {
         let b = Session::new([7u8; 32], [7u8; 32], false);
         let mut a = a;
         let mut b = b;
-        let (c, mut ct) = a.seal(b"data").unwrap();
+        let (c, mut ct) = a.seal(b"h", b"data").unwrap();
         ct[0] ^= 0xff;
-        assert!(b.open(c, &ct).is_err());
+        assert!(b.open(c, b"h", &ct).is_err());
     }
 }

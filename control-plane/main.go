@@ -6,6 +6,19 @@
 //	PORT       listen port (default 8080)
 //	REDIS_ADDR optional Redis address for the write-through mirror
 //	           (e.g. "redis:6379"); the plane works without it.
+//	KRONOS_STATE_FILE
+//	           registry snapshot path used when REDIS_ADDR is NOT
+//	           set (default "kronos-state.json" in the working
+//	           directory). Structural changes (node register/delete,
+//	           ACL changes, enrollment tokens) are persisted there
+//	           atomically and restored at startup, so a restart
+//	           without Redis no longer loses the mesh.
+//	KRONOS_ENROLLMENT_TOKENS
+//	           comma-separated plaintext single-use enrollment
+//	           tokens to pre-seed at startup (hashed before storage;
+//	           only the count is logged). Each lets one new node
+//	           register without the admin token and is consumed by
+//	           that registration.
 //	KRONOS_ADMIN_TOKEN
 //	           operator token gating ACL changes and first-time node
 //	           registrations. REQUIRED (minimum 16 characters): the
@@ -86,13 +99,38 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	st := store.NewMemoryStore(os.Getenv("REDIS_ADDR"))
-	// Restart recovery: when a Redis mirror exists, rebuild the
-	// registry and ACL policy from it instead of starting empty.
-	if n, a, err := st.RecoverFromMirror(); err != nil {
+	redisAddr := os.Getenv("REDIS_ADDR")
+	st := store.NewMemoryStore(redisAddr)
+	if redisAddr == "" {
+		// No Redis: persist the registry to a state file instead,
+		// with the same restore semantics as the mirror. A corrupt
+		// file is logged loudly and the plane starts empty (nodes
+		// re-provision) — it never crashes on bad state.
+		stateFile := os.Getenv("KRONOS_STATE_FILE")
+		if stateFile == "" {
+			stateFile = "kronos-state.json"
+		}
+		st.EnableFilePersistence(stateFile)
+		if n, a, e, err := st.RestoreFromFile(); err != nil {
+			log.Printf("store: state file %s could not be restored (%v); starting with EMPTY state — previously registered nodes must re-provision", stateFile, err)
+		} else if n > 0 || a > 0 || e > 0 {
+			log.Printf("store: restored %d node(s), %d ACL rule(s) and %d enrollment token(s) from state file %s", n, a, e, stateFile)
+		}
+	} else if n, a, err := st.RecoverFromMirror(); err != nil {
+		// Restart recovery: when a Redis mirror exists, rebuild the
+		// registry and ACL policy from it instead of starting empty.
 		log.Printf("store: mirror recovery failed (%v); starting with empty state", err)
 	} else if n > 0 || a > 0 {
 		log.Printf("store: recovered %d node(s) and %d ACL rule(s) from the Redis mirror", n, a)
+	}
+
+	// Pre-seed single-use enrollment tokens from the environment.
+	// Only the count is logged — the values are credentials.
+	if seeded := parseEnrollmentTokens(os.Getenv("KRONOS_ENROLLMENT_TOKENS")); len(seeded) > 0 {
+		for _, tok := range seeded {
+			st.AddEnrollmentHash(store.HashToken(tok))
+		}
+		log.Printf("store: seeded %d enrollment token(s) from KRONOS_ENROLLMENT_TOKENS", len(seeded))
 	}
 
 	// Stale-node reaper: nodes that stop heartbeating are marked
@@ -151,6 +189,18 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+// parseEnrollmentTokens splits the KRONOS_ENROLLMENT_TOKENS value
+// into individual tokens, dropping blanks and whitespace.
+func parseEnrollmentTokens(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // minAdminTokenLen is the shortest operator token accepted outside

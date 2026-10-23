@@ -1,9 +1,14 @@
-import { Key, Lock } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Key, Lock, Trash2 } from 'lucide-react';
 import type { PeerNode } from '../types/mesh';
 import { formatBytes } from '../lib/api';
 
 interface Props {
   node: PeerNode | null;
+  /// Revokes the node's membership via the control plane
+  /// (admin-only). Absent in demo mode, where there is nothing
+  /// real to revoke.
+  onRevoke?: (node: PeerNode) => Promise<void>;
 }
 
 const SUITE: Array<[string, string]> = [
@@ -17,7 +22,34 @@ const SUITE: Array<[string, string]> = [
 
 /// Cryptographic inspector: the selected node's identity material and
 /// the protocol suite its sessions run, with live traffic counters.
-export default function CryptographicInspector({ node }: Props) {
+export default function CryptographicInspector({ node, onRevoke }: Props) {
+  const [error, setError] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  useEffect(() => {
+    setError(null);
+  }, [node?.node_id]);
+
+  const handleRevoke = async () => {
+    if (!node || !onRevoke) return;
+    if (
+      !window.confirm(
+        `Revoke ${node.node_name} (${node.virtual_ip})? Its node token stops working immediately, and the node must be re-provisioned (admin or enrollment token) to rejoin the mesh.`,
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    setRevoking(true);
+    try {
+      await onRevoke(node);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'revoke node failed');
+    } finally {
+      setRevoking(false);
+    }
+  };
+
   return (
     <div className="rounded-xl border border-edge bg-panel p-4">
       <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-slate-300">
@@ -98,6 +130,24 @@ export default function CryptographicInspector({ node }: Props) {
             leave the node. Rekeying happens on a fresh handshake; the
             daemon rotates its ephemeral keypair every session.
           </p>
+
+          {onRevoke && (
+            <div className="border-t border-edge/60 pt-3">
+              <button
+                onClick={() => void handleRevoke()}
+                disabled={revoking}
+                className="flex items-center gap-1.5 rounded-lg border border-danger/40 px-3 py-1.5 text-xs font-medium text-danger transition-colors hover:bg-danger/10 disabled:opacity-40"
+              >
+                <Trash2 size={13} /> {revoking ? 'Revoking…' : 'Revoke node'}
+              </button>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
+                Removes this node from the mesh: its token is
+                invalidated at once and its virtual IP returns to the
+                pool. Requires the operator admin token.
+              </p>
+              {error && <p className="mt-2 text-xs text-danger">{error}</p>}
+            </div>
+          )}
         </div>
       )}
     </div>

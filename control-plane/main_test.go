@@ -87,3 +87,22 @@ func TestResolveTLSModeRequiredWithCertsStarts(t *testing.T) {
 		t.Fatalf("unexpected pair %q/%q", cert, key)
 	}
 }
+
+func TestParseEnrollmentTokens(t *testing.T) {
+	got := parseEnrollmentTokens(" alpha ,beta-token,,  gamma  ,")
+	want := []string{"alpha", "beta-token", "gamma"}
+	if len(got) != len(want) {
+		t.Fatalf("parseEnrollmentTokens = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("parseEnrollmentTokens = %v, want %v", got, want)
+		}
+	}
+	if got := parseEnrollmentTokens(""); len(got) != 0 {
+		t.Fatalf("empty env must seed nothing, got %v", got)
+	}
+	if got := parseEnrollmentTokens(" , ,"); len(got) != 0 {
+		t.Fatalf("blank entries must be dropped, got %v", got)
+	}
+}

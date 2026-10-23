@@ -61,6 +61,11 @@ type NodeRegisterRequest struct {
 	// AdminOverride is set by handlers when a valid admin token was
 	// presented; it authorizes role changes and credential rotation.
 	AdminOverride bool `json:"-"`
+	// EnrollmentAuthorized is set by handlers when a new-key
+	// registration presented a valid single-use enrollment token
+	// (AuthToken carries it). The store consumes the token only if
+	// the registration actually commits.
+	EnrollmentAuthorized bool `json:"-"`
 }
 
 // cgnatRange is the shared address space (RFC 6598) the mesh allocates

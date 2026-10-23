@@ -19,6 +19,7 @@ import {
   deleteAcl,
   formatBytes,
   loadDashboardData,
+  revokeNode,
 } from './lib/api';
 import type { AclRule, DashboardData, PeerNode } from './types/mesh';
 
@@ -121,6 +122,14 @@ export default function App() {
   const handleDeleteAcl = useCallback(
     async (id: string) => {
       await deleteAcl(id);
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const handleRevokeNode = useCallback(
+    async (node: PeerNode) => {
+      await revokeNode(node.node_id);
       await refresh();
     },
     [refresh],
@@ -277,7 +286,10 @@ export default function App() {
                 />
               </div>
               <div className="lg:col-span-2">
-                <CryptographicInspector node={selected} />
+                <CryptographicInspector
+                  node={selected}
+                  onRevoke={data.demo ? undefined : handleRevokeNode}
+                />
               </div>
             </section>
 

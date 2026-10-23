@@ -137,6 +137,20 @@ export async function deleteAcl(id: string): Promise<void> {
   }
 }
 
+export async function revokeNode(id: string): Promise<void> {
+  const resp = await fetch(`${CONTROL_URL}/api/v1/nodes/${id}`, {
+    method: 'DELETE',
+    headers: { ...authHeaders() },
+  });
+  if (!resp.ok) {
+    throw new Error(
+      resp.status === 401
+        ? 'revoke node returned 401 - the control plane requires an admin token (set it in the ACL panel)'
+        : `revoke node returned ${resp.status}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Demo dataset: rendered (clearly labelled) only when the control plane
 // is unreachable, so the console never shows a blank or broken state.

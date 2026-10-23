@@ -1,12 +1,15 @@
 // Package store implements the control plane's state store: a
-// thread-safe in-memory store that is authoritative for reads, with an
-// optional Redis write-through mirror. The control plane works fully
-// out of the box with no Redis running; when REDIS_ADDR points at a
-// reachable server, every node and policy write is mirrored there as
-// full state, and at startup RecoverFromMirror rebuilds the registry
-// and policy from that mirror — so a control-plane restart no longer
-// loses the mesh. Without Redis the state is memory-only and a restart
-// starts empty (nodes simply re-register).
+// thread-safe in-memory store that is authoritative for reads, with
+// restart persistence. When REDIS_ADDR points at a reachable server,
+// every structural write is mirrored there as full state, and at
+// startup RecoverFromMirror rebuilds the registry, policy and
+// enrollment set from that mirror — so a control-plane restart no
+// longer loses the mesh. Without Redis, EnableFilePersistence turns
+// on an atomic JSON state file with the same restore semantics.
+// With neither, a restart starts empty and previously registered
+// nodes are unknown: they must be re-provisioned with an enrollment
+// token (or the admin token), because a node identity alone does
+// not prove it should be trusted again.
 package store
 
 import (
@@ -35,8 +38,13 @@ import (
 type Store interface {
 	RegisterNode(req *models.NodeRegisterRequest, now time.Time) (*models.PeerNode, string, error)
 	Heartbeat(nodeID string, hb *models.HeartbeatPayload, token string, now time.Time) (*models.PeerNode, error)
+	DeleteNode(id string) bool
 	KeyExists(publicKey string) bool
 	AnyNodeTokenValid(token string) bool
+	MintEnrollmentToken() string
+	AddEnrollmentHash(hash string)
+	EnrollmentValid(token string) bool
+	ConsumeEnrollment(token string) bool
 	ListNodes() []models.PeerNode
 	Topology(now time.Time) models.MeshTopology
 	ListAcls() models.AclPolicyResponse
@@ -55,7 +63,21 @@ type MemoryStore struct {
 	poolLast uint32 // last assignable pool offset (test seam for exhaustion)
 	acls     []models.AclRule
 	aclVer   uint64
-	mirror   *redis.Client // optional write-through mirror, may be nil
+	// enrollHashes holds the SHA-256 hashes of outstanding
+	// single-use enrollment tokens. Only hashes are kept: the
+	// plaintext is shown to the operator exactly once at minting.
+	enrollHashes map[string]bool
+	// enrollConsumed remembers the hashes of enrollment tokens
+	// that have been USED, persistently (state file + mirror).
+	// Without it, startup re-seeding of KRONOS_ENROLLMENT_TOKENS
+	// would resurrect a consumed token on every restart, quietly
+	// breaking the single-use guarantee for env-provisioned
+	// tokens. Seeding skips any hash in this set.
+	enrollConsumed map[string]bool
+	mirror       *redis.Client // optional write-through mirror, may be nil
+	// stateFile, when non-empty (and no Redis mirror is in use),
+	// is the atomic JSON snapshot path; see persist.go.
+	stateFile string
 }
 
 // CGNAT pool: the full RFC 6598 100.64.0.0/10 block, expressed as offsets
@@ -111,9 +133,127 @@ func (s *MemoryStore) AnyNodeTokenValid(token string) bool {
 	return false
 }
 
+// MintEnrollmentToken creates a fresh single-use enrollment token
+// and records its hash. The plaintext is returned exactly once —
+// this return value is the only place it ever exists outside the
+// operator's hands.
+func (s *MemoryStore) MintEnrollmentToken() string {
+	tok := newNodeToken()
+	s.AddEnrollmentHash(hashToken(tok))
+	return tok
+}
+
+// AddEnrollmentHash records the SHA-256 hash of an enrollment token
+// as valid. Used by MintEnrollmentToken and by startup seeding of
+// KRONOS_ENROLLMENT_TOKENS.
+func (s *MemoryStore) AddEnrollmentHash(hash string) {
+	if hash == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.enrollConsumed[hash] {
+		// Already used once: single-use means never again,
+		// even if the operator's environment still lists it.
+		return
+	}
+	s.enrollHashes[hash] = true
+	s.mirrorEnrollment()
+	s.persistLocked()
+}
+
+// EnrollmentValid reports whether the presented plaintext token is
+// an outstanding enrollment token, without consuming it. The
+// comparison runs over hashes in constant time per entry.
+func (s *MemoryStore) EnrollmentValid(token string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.enrollmentValidLocked(token)
+}
+
+// ConsumeEnrollment validates the token and, if valid, burns it:
+// enrollment tokens are single-use, so a token that has registered
+// one node can never register another. Reports whether the token
+// was valid (and is now consumed).
+func (s *MemoryStore) ConsumeEnrollment(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.enrollmentValidLocked(token) {
+		return false
+	}
+	s.consumeEnrollmentLocked(token)
+	return true
+}
+
+func (s *MemoryStore) enrollmentValidLocked(token string) bool {
+	if token == "" {
+		return false
+	}
+	h := hashToken(token)
+	for stored := range s.enrollHashes {
+		if subtle.ConstantTimeCompare([]byte(h), []byte(stored)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// consumeEnrollmentLocked removes the token's hash and propagates
+// the removal to the mirror and the state file. Caller holds the
+// lock and has already validated the token.
+func (s *MemoryStore) consumeEnrollmentLocked(token string) {
+	h := hashToken(token)
+	delete(s.enrollHashes, h)
+	s.enrollConsumed[h] = true
+	s.mirrorEnrollment()
+	s.persistLocked()
+}
+
+func (s *MemoryStore) enrollmentConsumedListLocked() []string {
+	out := make([]string, 0, len(s.enrollConsumed))
+	for h := range s.enrollConsumed {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *MemoryStore) enrollmentHashListLocked() []string {
+	out := make([]string, 0, len(s.enrollHashes))
+	for h := range s.enrollHashes {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mirrorEnrollment writes the outstanding enrollment hash set to
+// Redis as a JSON list, so single-use semantics survive a
+// control-plane restart exactly like the registry does.
+func (s *MemoryStore) mirrorEnrollment() {
+	if s.mirror == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.mirror.Set(ctx, "kronos:enrollment", mustJSON(s.enrollmentHashListLocked()), 0).Err(); err != nil {
+		log.Printf("store: redis enrollment mirror failed: %v", err)
+	}
+	if err := s.mirror.Set(ctx, "kronos:enrollment_consumed", mustJSON(s.enrollmentConsumedListLocked()), 0).Err(); err != nil {
+		log.Printf("store: redis consumed-enrollment mirror failed: %v", err)
+	}
+}
+
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+// HashToken is the exported form of hashToken, for callers (startup
+// seeding of KRONOS_ENROLLMENT_TOKENS) that need to turn a plaintext
+// credential into the hash form the store keeps.
+func HashToken(token string) string {
+	return hashToken(token)
 }
 
 func newNodeToken() string {
@@ -135,11 +275,13 @@ func formatPoolIP(offset uint32) string {
 // the server answers a ping within the timeout, writes are mirrored.
 func NewMemoryStore(redisAddr string) *MemoryStore {
 	s := &MemoryStore{
-		byID:     make(map[string]*models.PeerNode),
-		byKey:    make(map[string]string),
-		usedIPs:  make(map[string]bool),
-		nextIP:   ipPoolBase,
-		poolLast: ipPoolLast,
+		byID:         make(map[string]*models.PeerNode),
+		byKey:        make(map[string]string),
+		usedIPs:      make(map[string]bool),
+		nextIP:       ipPoolBase,
+		poolLast:     ipPoolLast,
+		enrollHashes: make(map[string]bool),
+		enrollConsumed: make(map[string]bool),
 	}
 	if redisAddr != "" {
 		client := redis.NewClient(&redis.Options{Addr: redisAddr})
@@ -218,8 +360,17 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 			node.TokenHash = hashToken(issued)
 		}
 		s.mirrorNode(node)
+		s.persistLocked()
 		copy := *node
 		return &copy, issued, nil
+	}
+	// Enrollment-authorized first registration: re-check the token
+	// under the store lock (the handler checked without consuming).
+	// Consumption happens only below, once the registration has
+	// actually committed — a failure anywhere before that point
+	// (including IP exhaustion) leaves the token valid.
+	if req.EnrollmentAuthorized && !s.enrollmentValidLocked(req.AuthToken) {
+		return nil, "", ErrUnauthorized
 	}
 	virtualIP, err := s.allocateIP(req.VirtualIP)
 	if err != nil {
@@ -242,9 +393,42 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 	}
 	s.byID[node.NodeID] = node
 	s.byKey[node.PublicKey] = node.NodeID
+	if req.EnrollmentAuthorized {
+		// The node is committed: burn the single-use token.
+		s.consumeEnrollmentLocked(req.AuthToken)
+	}
 	s.mirrorNode(node)
+	s.persistLocked()
 	copy := *node
 	return &copy, issued, nil
+}
+
+// DeleteNode revokes a node's membership: the registry entry, its
+// public-key index and its virtual-IP reservation are removed, and
+// the mirror copy is deleted. From this moment the node's token is
+// worthless (heartbeats fail as unknown node) and its key, if it
+// ever comes back, is a brand-new identity that must be provisioned
+// again (admin or enrollment token). Reports whether the node
+// existed.
+func (s *MemoryStore) DeleteNode(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, ok := s.byID[id]
+	if !ok {
+		return false
+	}
+	delete(s.byID, id)
+	delete(s.byKey, node.PublicKey)
+	delete(s.usedIPs, node.VirtualIP)
+	if s.mirror != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.mirror.Del(ctx, "kronos:node:"+id).Err(); err != nil {
+			log.Printf("store: redis mirror delete failed for %s: %v", id, err)
+		}
+	}
+	s.persistLocked()
+	return true
 }
 
 // KeyExists reports whether a public key is already registered.
@@ -356,6 +540,7 @@ func (s *MemoryStore) CreateAcl(rule models.AclRule) (models.AclRule, error) {
 	s.acls = append(s.acls, rule)
 	s.aclVer++
 	s.mirrorAcls()
+	s.persistLocked()
 	return rule, nil
 }
 
@@ -367,6 +552,7 @@ func (s *MemoryStore) DeleteAcl(id string) bool {
 			s.acls = append(s.acls[:i], s.acls[i+1:]...)
 			s.aclVer++
 			s.mirrorAcls()
+			s.persistLocked()
 			return true
 		}
 	}
@@ -460,12 +646,13 @@ func nodeFromHash(nodeID string, f map[string]string) (*models.PeerNode, error) 
 	return node, nil
 }
 
-// RecoverFromMirror rebuilds the registry and ACL policy from the
-// Redis mirror after a control-plane restart. Recovered nodes come
-// back OFFLINE — the mirror proves they existed, not that they are
-// alive; a heartbeat (authenticated by the recovered token hash)
-// marks them online again. Returns the number of nodes and ACL rules
-// recovered. With no mirror configured it is a no-op.
+// RecoverFromMirror rebuilds the registry, ACL policy and
+// outstanding enrollment set from the Redis mirror after a
+// control-plane restart. Recovered nodes come back OFFLINE — the
+// mirror proves they existed, not that they are alive; a heartbeat
+// (authenticated by the recovered token hash) marks them online
+// again. Returns the number of nodes and ACL rules recovered.
+// With no mirror configured it is a no-op.
 func (s *MemoryStore) RecoverFromMirror() (int, int, error) {
 	if s.mirror == nil {
 		return 0, 0, nil
@@ -494,6 +681,26 @@ func (s *MemoryStore) RecoverFromMirror() (int, int, error) {
 		s.byKey[node.PublicKey] = node.NodeID
 		s.usedIPs[node.VirtualIP] = true
 		nodes++
+	}
+	if raw, err := s.mirror.Get(ctx, "kronos:enrollment_consumed").Result(); err == nil && raw != "" {
+		var consumed []string
+		if err := json.Unmarshal([]byte(raw), &consumed); err == nil {
+			for _, h := range consumed {
+				s.enrollConsumed[h] = true
+			}
+		}
+	}
+	if raw, err := s.mirror.Get(ctx, "kronos:enrollment").Result(); err == nil && raw != "" {
+		var hashes []string
+		if err := json.Unmarshal([]byte(raw), &hashes); err == nil {
+			for _, h := range hashes {
+				if !s.enrollConsumed[h] {
+				s.enrollHashes[h] = true
+			}
+			}
+		} else {
+			log.Printf("store: mirrored enrollment set is corrupt and was NOT recovered (outstanding enrollment tokens must be re-minted or re-seeded): %v", err)
+		}
 	}
 	rules := 0
 	if raw, err := s.mirror.Get(ctx, "kronos:acls").Result(); err == nil && raw != "" {

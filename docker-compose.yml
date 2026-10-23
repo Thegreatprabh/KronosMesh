@@ -11,11 +11,20 @@ services:
       PORT: "8080"
       REDIS_ADDR: "redis:6379"
       # REQUIRED: set KRONOS_ADMIN_TOKEN in your shell (16+ chars) -
-      # the control plane refuses to start without it, and the mesh
-      # nodes present the same value when registering. For throwaway
+      # the control plane refuses to start without it. The admin
+      # token is the OPERATOR's credential: it lives here and in
+      # your shell/dashboard only. The mesh nodes never receive it;
+      # they enroll with the single-use tokens below. For throwaway
       # local development only, you may instead uncomment:
       # KRONOS_DEV_OPEN_ADMIN: "1"
       KRONOS_ADMIN_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
+      # Demo single-use enrollment tokens (pre-seeded at startup).
+      # Each is consumed by the first registration that presents
+      # it — mesh-node-1 uses the first, mesh-node-2 the second.
+      # Replace these labelled demo values with fresh random tokens
+      # (or mint tokens via POST /api/v1/enrollment-tokens) for any
+      # real deployment.
+      KRONOS_ENROLLMENT_TOKENS: "demo-enroll-edge-01-0000000000000001,demo-enroll-edge-02-0000000000000002"
     ports:
       # Loopback only: this API carries bearer tokens and full
       # mesh topology. The dashboard (in the operator's local
@@ -47,7 +56,10 @@ services:
       # http:// endpoints. If you expose the plane beyond this
       # network, terminate TLS and switch the URL to https://.
       KRONOS_ALLOW_INSECURE_HTTP: "1"
-      KRONOS_CONTROL_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
+      # Single-use enrollment token (first demo value seeded on the
+      # control plane above): presented once, at first registration,
+      # and consumed by it. This node never sees the admin token.
+      KRONOS_CONTROL_TOKEN: "demo-enroll-edge-01-0000000000000001"
       KRONOS_LISTEN_PORT: "51820"
     ports:
       - "51820:51820/udp"
@@ -71,7 +83,11 @@ services:
       # http:// endpoints. If you expose the plane beyond this
       # network, terminate TLS and switch the URL to https://.
       KRONOS_ALLOW_INSECURE_HTTP: "1"
-      KRONOS_CONTROL_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
+      # Single-use enrollment token (second demo value seeded on
+      # the control plane above): presented once, at first
+      # registration, and consumed by it. This node never sees the
+      # admin token.
+      KRONOS_CONTROL_TOKEN: "demo-enroll-edge-02-0000000000000002"
       KRONOS_LISTEN_PORT: "51820"
     ports:
       - "51821:51820/udp"
