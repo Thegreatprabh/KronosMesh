@@ -318,6 +318,14 @@ func NewMemoryStore(redisAddr string) *MemoryStore {
 	return s
 }
 
+// MirrorEnabled reports whether the write-through Redis mirror
+// is live (configured AND reachable at construction). Callers
+// use it to fall back to state-file persistence when the mirror
+// the operator configured is unavailable.
+func (s *MemoryStore) MirrorEnabled() bool {
+	return s.mirror != nil
+}
+
 // allocateIP assigns a virtual IP. A requested address that is still free
 // is honored; otherwise the next free address from the pool cursor is
 // used. The cursor only ever moves forward, so allocation always

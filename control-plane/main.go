@@ -45,9 +45,11 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -101,11 +103,19 @@ func main() {
 	}
 	redisAddr := os.Getenv("REDIS_ADDR")
 	st := store.NewMemoryStore(redisAddr)
-	if redisAddr == "" {
-		// No Redis: persist the registry to a state file instead,
-		// with the same restore semantics as the mirror. A corrupt
-		// file is logged loudly and the plane starts empty (nodes
+	if !st.MirrorEnabled() {
+		// No working Redis mirror — either REDIS_ADDR is unset, or
+		// it is set but unreachable at startup (the store logs
+		// which). Persist the registry to a state file instead,
+		// with the same restore semantics as the mirror: the
+		// operator configured persistence, so a dead Redis must
+		// not silently degrade the plane to memory-only (a
+		// restart would forget every node). A corrupt file is
+		// logged loudly and the plane starts empty (nodes
 		// re-provision) — it never crashes on bad state.
+		if redisAddr != "" {
+			log.Printf("store: WARNING: REDIS_ADDR is set but the mirror is unavailable; falling back to state-file persistence (the mirror's contents, if any, are NOT loaded — the state file is this plane's recovery source until Redis returns)")
+		}
 		stateFile := os.Getenv("KRONOS_STATE_FILE")
 		if stateFile == "" {
 			stateFile = "kronos-state.json"
@@ -161,6 +171,7 @@ func main() {
 	router := gin.Default()
 	router.Use(corsMiddleware())
 	router.Use(bodyLimitMiddleware())
+	router.Use(authThrottleMiddleware(newAuthThrottle()))
 	api.RegisterRoutes(router, &api.Handlers{Store: st, AdminToken: adminToken})
 
 	// Explicit server timeouts: the default http.Server has none, so a
@@ -242,6 +253,125 @@ func resolveTLSMode(getenv func(string) string) (certFile, keyFile string, err e
 		return "", "", fmt.Errorf("KRONOS_REQUIRE_TLS=1 but KRONOS_TLS_CERT/KRONOS_TLS_KEY are not set: refusing to serve operator endpoints and bearer tokens over plaintext HTTP. Provide a certificate pair, or terminate TLS at a trusted reverse proxy and keep this port reachable only from that proxy")
 	}
 	return certFile, keyFile, nil
+}
+
+// ---------------------------------------------------------------------------
+// Failed-auth throttling.
+//
+// Until now a client could hammer the plane with invalid bearer
+// tokens forever — every 401 was free. The throttle counts FAILED
+// authentications (HTTP 401/403) per client IP over a sliding
+// window; past the limit the source is refused with 429 for a
+// cooldown. Successful requests never count (a busy healthy mesh
+// authenticates constantly), and the health endpoint is exempt
+// (it carries no credential).
+//
+// The key is the TCP peer address, NOT X-Forwarded-For: a
+// forwarded header is attacker-controlled unless a trusted proxy
+// sets it. Behind a reverse proxy the throttle therefore keys on
+// the proxy's address — coarser, but never spoofable; operators
+// who terminate at a proxy should rate-limit there as well.
+//
+// A legitimately misconfigured node (e.g. revoked token, ACL
+// polls refused every cycle) will trip the throttle and then be
+// refused in bursts — which is the intended pressure: it is
+// indistinguishable from a token-guessing client, and its real
+// fix is re-provisioning, not retries.
+const (
+	authFailLimit    = 60
+	authFailWindow   = 5 * time.Minute
+	authBlockFor     = 2 * time.Minute
+	authThrottleMax  = 4096 // tracked sources cap (oldest evicted)
+	authRetryAfterS  = 120
+)
+
+type throttleEntry struct {
+	fails        []time.Time
+	blockedUntil time.Time
+}
+
+type authThrottle struct {
+	mu      sync.Mutex
+	entries map[string]*throttleEntry
+	now     func() time.Time
+}
+
+func newAuthThrottle() *authThrottle {
+	return &authThrottle{entries: make(map[string]*throttleEntry), now: time.Now}
+}
+
+func clientKey(c *gin.Context) string {
+	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err != nil {
+		return c.Request.RemoteAddr
+	}
+	return host
+}
+
+// blocked reports whether `key` is currently in cooldown.
+func (t *authThrottle) blocked(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.entries[key]
+	return ok && t.now().Before(e.blockedUntil)
+}
+
+// recordFailure notes one failed authentication for `key` and
+// starts the cooldown when the window limit is reached.
+func (t *authThrottle) recordFailure(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	if len(t.entries) >= authThrottleMax {
+		// Bound memory under a rotating-source flood: evict the
+		// entry whose block expires soonest (or an unblocked one).
+		var victim string
+		var victimUntil time.Time
+		for k, e := range t.entries {
+			if victim == "" || e.blockedUntil.Before(victimUntil) {
+				victim, victimUntil = k, e.blockedUntil
+			}
+		}
+		delete(t.entries, victim)
+	}
+	e := t.entries[key]
+	if e == nil {
+		e = &throttleEntry{}
+		t.entries[key] = e
+	}
+	cutoff := now.Add(-authFailWindow)
+	kept := e.fails[:0]
+	for _, at := range e.fails {
+		if at.After(cutoff) {
+			kept = append(kept, at)
+		}
+	}
+	e.fails = append(kept, now)
+	if len(e.fails) >= authFailLimit {
+		e.blockedUntil = now.Add(authBlockFor)
+		e.fails = nil
+	}
+}
+
+func authThrottleMiddleware(t *authThrottle) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.Path == "/api/v1/health" {
+			c.Next()
+			return
+		}
+		key := clientKey(c)
+		if t.blocked(key) {
+			c.Header("Retry-After", fmt.Sprintf("%d", authRetryAfterS))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "too many failed authentication attempts; retry later",
+			})
+			return
+		}
+		c.Next()
+		if status := c.Writer.Status(); status == http.StatusUnauthorized || status == http.StatusForbidden {
+			t.recordFailure(key)
+		}
+	}
 }
 
 // bodyLimitMiddleware caps request bodies (registrations, heartbeats and
