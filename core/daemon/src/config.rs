@@ -175,32 +175,48 @@ impl Config {
                 }
             }
         }
-        if let Ok(v) = std::env::var("KRONOS_NODE_NAME") { cfg.node_name = v; }
-        if let Ok(v) = std::env::var("KRONOS_ROLE") { cfg.role = v; }
+        if let Ok(v) = std::env::var("KRONOS_NODE_NAME") { if !v.trim().is_empty() { cfg.node_name = v; } }
+        if let Ok(v) = std::env::var("KRONOS_ROLE") { if !v.trim().is_empty() { cfg.role = v; } }
         if let Ok(v) = std::env::var("KRONOS_LISTEN_PORT") {
             cfg.listen_port = v.parse().context("KRONOS_LISTEN_PORT must be a number")?;
         }
-        if let Ok(v) = std::env::var("KRONOS_CONTROL_URL") { cfg.control_url = v; }
+        if let Ok(v) = std::env::var("KRONOS_CONTROL_URL") { if !v.trim().is_empty() { cfg.control_url = v; } }
         if let Ok(v) = std::env::var("KRONOS_STATE_DIR") { cfg.state_dir = PathBuf::from(v); }
         if let Ok(v) = std::env::var("KRONOS_EBPF_OBJECT") { cfg.ebpf_object = Some(v); }
         if let Ok(v) = std::env::var("KRONOS_STUN_SERVER") { cfg.stun_server = Some(v); }
         if let Ok(v) = std::env::var("KRONOS_ADVERTISE_ENDPOINT") {
             cfg.advertise_endpoint = Some(v);
         }
-        if let Ok(v) = std::env::var("KRONOS_TUN") {
-            cfg.tun = v == "1" || v.eq_ignore_ascii_case("true");
+        if let Some(b) = env_bool("KRONOS_TUN") {
+            cfg.tun = b;
         }
-        if let Ok(v) = std::env::var("KRONOS_DNS") {
-            cfg.dns = !(v == "0" || v.eq_ignore_ascii_case("false"));
+        if let Some(b) = env_bool("KRONOS_DNS") {
+            cfg.dns = b;
         }
-        if let Ok(v) = std::env::var("KRONOS_DNS_UPSTREAM") { cfg.dns_upstream = v; }
-        if let Ok(v) = std::env::var("KRONOS_ALLOW_INSECURE_HTTP") {
-            cfg.allow_insecure_http = v == "1" || v.eq_ignore_ascii_case("true");
+        if let Ok(v) = std::env::var("KRONOS_DNS_UPSTREAM") { if !v.trim().is_empty() { cfg.dns_upstream = v; } }
+        if let Some(b) = env_bool("KRONOS_ALLOW_INSECURE_HTTP") {
+            cfg.allow_insecure_http = b;
         }
-        if let Ok(v) = std::env::var("KRONOS_CONTROL_TOKEN") {
+        if let Ok(v) = std::env::var("KRONOS_CONTROL_TOKEN") { if !v.is_empty() {
             cfg.control_token = Some(v);
         }
+        }
         Ok(cfg)
+    }
+}
+
+/// Parses a boolean environment variable with ONE convention
+/// for every flag: 1/true/yes/on enable, 0/false/no/off disable
+/// (case-insensitive), anything else (including empty) leaves
+/// the current value untouched. Before this helper, KRONOS_TUN
+/// used the enabling set while KRONOS_DNS treated everything
+/// except 0/false as ON — `KRONOS_DNS=off` turned DNS on.
+fn env_bool(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -248,6 +264,40 @@ struct IdentityFile {
     public_key: String,
 }
 
+/// Writes `contents` to `path` atomically with owner-only
+/// permissions FROM THE START: any stale temp file is removed,
+/// the new temp file is created with mode 0600 (unix) before
+/// any secret bytes land in it, fsynced, then renamed over the
+/// destination, followed by a directory fsync. A crash leaves
+/// the old or the new complete file — and the secret is never
+/// briefly world-readable under the process umask. (The
+/// failure class the INIT freshness file was hardened against
+/// in v1.5.0; the credential files were missed then.)
+pub fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 pub struct Identity {
     secret: StaticSecret,
     pub public: PublicKey,
@@ -279,12 +329,7 @@ impl Identity {
                 private_key: hex_encode(secret.as_bytes()),
                 public_key: hex_encode(public.as_bytes()),
             };
-            std::fs::write(&path, serde_json::to_string_pretty(&file)?)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            write_file_atomic(&path, &serde_json::to_string_pretty(&file)?)?;
             Ok(Self { secret, public })
         }
     }
@@ -321,14 +366,9 @@ impl NodeState {
     pub fn save(&self, state_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join("node_state.json");
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
-        // The state file now carries a credential; keep it owner-only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        // The state file carries a credential: atomic write,
+        // owner-only from the first byte (see the helper).
+        write_file_atomic(&path, &serde_json::to_string_pretty(self)?)
     }
 }
 
@@ -347,6 +387,38 @@ pub fn proposed_virtual_ip(public_key: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_file_write_is_atomic_and_owner_only() {
+        // Round 8: credential files are created 0600 from the
+        // first byte and renamed into place — never written
+        // world-readable and chmodded afterwards.
+        let dir = std::env::temp_dir().join(format!(
+            "kronos-atomic-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.json");
+        write_file_atomic(&path, "{\"v\": 1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"v\": 1}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "credential file must be owner-only");
+        }
+        // Overwrite replaces content atomically and keeps the mode.
+        write_file_atomic(&path, "{\"v\": 2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"v\": 2}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert!(!dir.join("identity.json.tmp").exists(), "temp file must be renamed away");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn control_url_token_transport_policy() {

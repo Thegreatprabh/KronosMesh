@@ -246,6 +246,41 @@ func TestStoreRejectsSpoofedReRegisterAndHeartbeat(t *testing.T) {
 
 // TestRegisterRejectsOutOfRangeVirtualIP pins the requested-address
 // validation: virtual IPs must live inside the mesh range.
+// Round 8: the pool cursor never hands out the network address
+// (offset 0), the reserved offset 1, or the broadcast address —
+// and a node must not be able to CLAIM them via a requested
+// virtual IP either. Reserved requests fall back to a normal
+// pool assignment.
+func TestRegisterCannotClaimReservedAddresses(t *testing.T) {
+	for _, reserved := range []string{"100.64.0.0", "100.64.0.1", "100.127.255.255"} {
+		s := NewMemoryStore("")
+		key, keyBytes := keyFor("reserved-" + reserved)
+		req := testRequest("claimer", key)
+		req.Fingerprint = models.Fingerprint(keyBytes)
+		req.VirtualIP = reserved
+		node, _, err := s.RegisterNode(req, time.Now().UTC())
+		if err != nil {
+			t.Fatalf("registration with requested %s should fall back to the pool, got error: %v", reserved, err)
+		}
+		if node.VirtualIP == reserved {
+			t.Fatalf("node claimed reserved address %s", reserved)
+		}
+	}
+	// Sanity: a normal in-pool request is still honored.
+	s := NewMemoryStore("")
+	key, keyBytes := keyFor("normal-request")
+	req := testRequest("normal", key)
+	req.Fingerprint = models.Fingerprint(keyBytes)
+	req.VirtualIP = "100.64.0.10"
+	node, _, err := s.RegisterNode(req, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("normal registration failed: %v", err)
+	}
+	if node.VirtualIP != "100.64.0.10" {
+		t.Fatalf("normal requested IP not honored: got %s", node.VirtualIP)
+	}
+}
+
 func TestRegisterRejectsOutOfRangeVirtualIP(t *testing.T) {
 	s := NewMemoryStore("")
 	key, keyBytes := keyFor("out-of-range-node")

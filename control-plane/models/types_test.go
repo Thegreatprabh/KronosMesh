@@ -89,6 +89,26 @@ func TestAclPolicyMatchesFixture(t *testing.T) {
 	assertSameShape(t, "acl_policy_response", roundTripMap(t, pol), want)
 }
 
+func TestRegisterResponseMatchesFixture(t *testing.T) {
+	want := fixtureMap(t, "node_register_response.json")
+	var resp NodeRegisterResponse
+	data, _ := json.Marshal(want)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	assertSameShape(t, "node_register_response", roundTripMap(t, resp), want)
+}
+
+func TestHeartbeatResponseMatchesFixture(t *testing.T) {
+	want := fixtureMap(t, "heartbeat_response.json")
+	var resp HeartbeatResponse
+	data, _ := json.Marshal(want)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	assertSameShape(t, "heartbeat_response", roundTripMap(t, resp), want)
+}
+
 func TestTopologyNodeMatchesFixture(t *testing.T) {
 	want := fixtureMap(t, "mesh_topology.json")
 	nodes, ok := want["nodes"].([]interface{})

@@ -261,7 +261,16 @@ mod imp {
             let mut buf = vec![0u8; 65535];
             loop {
                 match device.read_packet(&mut buf) {
-                    Ok(0) => return,
+                    Ok(0) => {
+                        // Never silent: host->mesh traffic has
+                        // stopped while everything else (heartbeats,
+                        // status, the interface itself) still looks
+                        // healthy — the operator must see this.
+                        eprintln!(
+                            "[kronos] TUN pump: device read returned 0 (closed); host traffic into the mesh has stopped"
+                        );
+                        return;
+                    }
                     Ok(n) => {
                         let packet = &buf[..n];
                         if let Some(dst) = ipv4_dst(packet) {
@@ -272,7 +281,12 @@ mod imp {
                             }
                         }
                     }
-                    Err(_) => return,
+                    Err(e) => {
+                        eprintln!(
+                            "[kronos] TUN pump: device read failed: {e}; host traffic into the mesh has stopped"
+                        );
+                        return;
+                    }
                 }
             }
         })

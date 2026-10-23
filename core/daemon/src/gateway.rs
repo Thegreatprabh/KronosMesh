@@ -53,6 +53,7 @@
 //! a daemon with the v2 stream protocol — the frame format changed
 //! (sequence numbers), so v1 and v2 gateways do not interoperate.
 
+use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -114,6 +115,22 @@ impl<T: Transport> Gateway<T> {
     /// Registers a stream half before its pumps start, so a pump
     /// that ends instantly still finds (and cleans) its entry.
     fn register_stream(&self, peer_vip: &str, stream_id: u32, dir: Dir) {
+        // Never overwrite a live half: replacing it would drop
+        // the old pumps' abort handles (they keep running) while
+        // their pump_finished calls decrement the NEW half's
+        // counter — premature teardown of the live stream. A
+        // duplicate registration means the old half is still
+        // draining; the tunnel dedups retransmitted OPENs, so
+        // this is a defensive guard, and keeping the existing
+        // entry is the safe side.
+        if self
+            .streams
+            .lock()
+            .unwrap()
+            .contains_key(&(peer_vip.to_string(), stream_id, dir))
+        {
+            return;
+        }
         self.streams.lock().unwrap().insert(
             (peer_vip.to_string(), stream_id, dir),
             StreamHalf {
@@ -193,8 +210,22 @@ impl<T: Transport> Gateway<T> {
                         "[kronos] gateway: {} listening on {} -> {}:{} via mesh",
                         fwd.name, fwd.listen, fwd.target_vip, fwd.target_port
                     );
-                    while let Ok((stream, _)) = listener.accept().await {
-                        gw.handle_local_conn(stream, &fwd);
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, _)) => gw.handle_local_conn(stream, &fwd),
+                            Err(e) => {
+                                // A transient accept error (e.g.
+                                // EMFILE under a connection burst)
+                                // must not kill the forward for the
+                                // life of the process — log it,
+                                // back off briefly, keep serving.
+                                eprintln!(
+                                    "[kronos] gateway: accept on {} for service {} failed: {e}",
+                                    fwd.listen, fwd.name
+                                );
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
                     }
                 }
                 Err(e) => eprintln!(
@@ -343,8 +374,16 @@ impl<T: Transport> Gateway<T> {
                         service,
                         port,
                     } => {
-                        gw.handle_open(src_vip, src_role, stream_id, service, port)
-                            .await;
+                        // Per-open task: handle_open dials a local
+                        // TCP service, and a blackholed port can
+                        // hang that connect for minutes — inline
+                        // handling would stall EVERY subsequent
+                        // inbound open behind it.
+                        let gw2 = gw.clone();
+                        tokio::spawn(async move {
+                            gw2.handle_open(src_vip, src_role, stream_id, service, port)
+                                .await;
+                        });
                     }
                 }
             }
@@ -368,11 +407,25 @@ impl<T: Transport> Gateway<T> {
             self.tunnel.reset_stream(&src_vip, stream_id).await;
             return;
         }
-        let stream = match TcpStream::connect(("127.0.0.1", port)).await {
-            Ok(s) => s,
-            Err(e) => {
+        // Bounded connect: a local firewall dropping SYNs would
+        // otherwise hang this for the OS TCP timeout (~2 min).
+        let stream = match tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 eprintln!(
                     "[kronos] gateway: local service {service} on 127.0.0.1:{port} unreachable: {e}"
+                );
+                self.tunnel.reset_stream(&src_vip, stream_id).await;
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "[kronos] gateway: local service {service} on 127.0.0.1:{port} did not accept within 5s"
                 );
                 self.tunnel.reset_stream(&src_vip, stream_id).await;
                 return;

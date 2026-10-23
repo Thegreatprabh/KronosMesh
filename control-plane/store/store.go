@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"net/netip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,6 +91,26 @@ const (
 	ipPoolNetBase = 0x64400000 // 100.64.0.0 as a uint32
 )
 
+// assignableOffset reports whether `ip` (a dotted-quad string)
+// falls inside the assignable pool range — i.e. it is not the
+// network address (offset 0), the reserved offset 1, or the
+// broadcast address (offset 0x3FFFFF). The pool cursor never
+// hands those out; a node must not be able to claim them via a
+// requested virtual IP either.
+func assignableOffset(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is4() {
+		return false
+	}
+	u := addr.As4()
+	v := uint32(u[0])<<24 | uint32(u[1])<<16 | uint32(u[2])<<8 | uint32(u[3])
+	if v < ipPoolNetBase {
+		return false
+	}
+	off := v - ipPoolNetBase
+	return off >= ipPoolBase && off <= ipPoolLast
+}
+
 // ErrIPPoolExhausted is returned when every address in the pool is taken.
 var ErrIPPoolExhausted = errors.New("virtual IP pool exhausted")
 
@@ -123,8 +144,8 @@ func (s *MemoryStore) AnyNodeTokenValid(token string) bool {
 		return false
 	}
 	h := hashToken(token)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, node := range s.byID {
 		if node.TokenHash != "" && subtle.ConstantTimeCompare([]byte(h), []byte(node.TokenHash)) == 1 {
 			return true
@@ -305,7 +326,7 @@ func NewMemoryStore(redisAddr string) *MemoryStore {
 // unbounded loop while the caller held the store mutex, so 250 colliding
 // registrations froze the entire control plane.)
 func (s *MemoryStore) allocateIP(requested string) (string, error) {
-	if requested != "" && !s.usedIPs[requested] {
+	if requested != "" && !s.usedIPs[requested] && assignableOffset(requested) {
 		s.usedIPs[requested] = true
 		return requested, nil
 	}

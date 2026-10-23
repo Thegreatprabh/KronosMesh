@@ -27,6 +27,29 @@ impl ControlClient {
         }
     }
 
+    /// Reads a response body under a hard size cap, then decodes
+    /// it. A compromised or broken control plane must not be
+    /// able to make the daemon buffer an unbounded body into
+    /// memory (topology/ACL responses are small by design).
+    async fn read_json_capped<T: serde::de::DeserializeOwned>(
+        mut resp: reqwest::Response,
+        what: &str,
+    ) -> Result<T> {
+        const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("reading {what} response"))?
+        {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                anyhow::bail!("{what} response exceeds {MAX_RESPONSE_BYTES} bytes");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body).with_context(|| format!("decoding {what} response"))
+    }
+
     pub async fn register(
         &self,
         req: &NodeRegisterRequest,
@@ -45,7 +68,7 @@ impl ControlClient {
             .context("register request failed")?
             .error_for_status()
             .context("control plane rejected registration")?;
-        resp.json().await.context("decoding register response")
+        Self::read_json_capped(resp, "register").await
     }
 
     pub async fn heartbeat(
@@ -70,7 +93,7 @@ impl ControlClient {
             .context("heartbeat request failed")?
             .error_for_status()
             .context("control plane rejected heartbeat")?;
-        resp.json().await.context("decoding heartbeat response")
+        Self::read_json_capped(resp, "heartbeat").await
     }
 
     pub async fn fetch_acls(&self, token: Option<&str>) -> Result<AclPolicyResponse> {
@@ -84,7 +107,7 @@ impl ControlClient {
             .context("ACL fetch failed")?
             .error_for_status()
             .context("control plane rejected ACL fetch")?;
-        resp.json().await.context("decoding ACL response")
+        Self::read_json_capped(resp, "ACL").await
     }
 
     pub async fn fetch_topology(&self, token: Option<&str>) -> Result<MeshTopology> {
@@ -98,7 +121,7 @@ impl ControlClient {
             .context("topology fetch failed")?
             .error_for_status()
             .context("control plane rejected topology fetch")?;
-        resp.json().await.context("decoding topology response")
+        Self::read_json_capped(resp, "topology").await
     }
 }
 

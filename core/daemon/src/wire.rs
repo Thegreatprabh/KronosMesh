@@ -138,6 +138,24 @@ mod tests {
     }
 
     #[test]
+    fn register_response_matches_fixture_fields() {
+        // The response direction was unpinned until Round 8 —
+        // exactly the payloads this daemon parses FROM the plane.
+        let v: serde_json::Value =
+            serde_json::from_str(&fixture("node_register_response.json")).unwrap();
+        let resp: NodeRegisterResponse = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(v, serde_json::to_value(&resp).unwrap());
+    }
+
+    #[test]
+    fn heartbeat_response_matches_fixture_fields() {
+        let v: serde_json::Value =
+            serde_json::from_str(&fixture("heartbeat_response.json")).unwrap();
+        let resp: HeartbeatResponse = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(v, serde_json::to_value(&resp).unwrap());
+    }
+
+    #[test]
     fn topology_matches_fixture_fields() {
         let v: serde_json::Value =
             serde_json::from_str(&fixture("mesh_topology.json")).unwrap();

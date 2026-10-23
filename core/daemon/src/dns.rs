@@ -194,13 +194,33 @@ pub async fn serve(bind_ip: Ipv4Addr, table: NameTable, upstream: String) -> Res
         .context("resolve DNS upstream")?
         .next()
         .context("DNS upstream resolved to nothing")?;
-    let mut buf = vec![0u8; 4096];
+    // Full-size datagram buffer: a 4096-byte cap truncated large
+    // queries (silently unanswered) and large upstream responses
+    // (relayed cut, with no truncation signal to the client).
+    let mut buf = vec![0u8; 65535];
+    // Bounded concurrency: each query used to spawn an unbounded
+    // task opening its own upstream socket.
+    let permits = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
-        let (n, from) = socket.recv_from(&mut buf).await?;
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                // One receive error must not kill mesh DNS for
+                // the life of the process.
+                eprintln!("[kronos] mesh DNS receive failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let query = buf[..n].to_vec();
         let socket = socket.clone();
         let table = table.clone();
+        let permit = match permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => continue, // overloaded: drop the query, stay alive
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if let Some(resp) = answer_query(&query, &table, upstream_addr).await {
                 let _ = socket.send_to(&resp, from).await;
             }
@@ -234,7 +254,7 @@ async fn forward_upstream(query: &[u8], upstream_addr: SocketAddr) -> Option<Vec
     let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
     socket.connect(upstream_addr).await.ok()?;
     socket.send(query).await.ok()?;
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 65535];
     let recv = tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv(&mut buf)).await;
     let n = recv.ok()?.ok()?;
     if n < 2 || buf[0..2] != query[0..2] {

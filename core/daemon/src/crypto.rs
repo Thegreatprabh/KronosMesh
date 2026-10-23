@@ -514,24 +514,30 @@ impl Drop for Session {
 // ACL decisions keyed on the source are only made after this
 // check passes.
 
-/// Derives the pairwise end-to-end key between two nodes.
-pub fn e2e_key(my_secret: &StaticSecret, their_public: &PublicKey) -> Result<[u8; 32]> {
+/// Derives the DIRECTIONAL end-to-end key for traffic sent BY
+/// `sender_public`'s owner: the two directions of a pair use
+/// different keys (the sender's public key is bound into the
+/// derivation), so nonce space and compromise are per-direction.
+/// Both sides derive a direction's key from the same DH secret.
+pub fn e2e_key(my_secret: &StaticSecret, their_public: &PublicKey, sender_public: &PublicKey) -> Result<[u8; 32]> {
     let shared = dh(my_secret, their_public)?;
-    let okm = hkdf_blake2s(b"kronos-e2e-v1", shared.as_bytes(), &[], 32);
+    let okm = hkdf_blake2s(b"kronos-e2e-v2", shared.as_bytes(), sender_public.as_bytes(), 32);
     let mut key = [0u8; 32];
     key.copy_from_slice(&okm);
     Ok(key)
 }
 
 /// Seals `plaintext` for the destination. Output: nonce(12) ||
-/// ciphertext. src/dst are bound as associated data, so a sealed
-/// body cannot be re-addressed to another pair.
-pub fn e2e_seal(key: &[u8; 32], src: &[u8; 4], dst: &[u8; 4], plaintext: &[u8]) -> Result<Vec<u8>> {
+/// ciphertext. kind/src/dst are bound as associated data, so a
+/// sealed body can neither be re-addressed to another pair nor
+/// re-labelled as another protocol kind by a relay.
+pub fn e2e_seal(key: &[u8; 32], kind: u8, src: &[u8; 4], dst: &[u8; 4], plaintext: &[u8]) -> Result<Vec<u8>> {
     use rand_core::RngCore;
     let mut nonce = [0u8; 12];
     rand_core::OsRng.fill_bytes(&mut nonce);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let mut aad = Vec::with_capacity(8);
+    let mut aad = Vec::with_capacity(9);
+    aad.push(kind);
     aad.extend_from_slice(src);
     aad.extend_from_slice(dst);
     let ct = cipher
@@ -546,13 +552,14 @@ pub fn e2e_seal(key: &[u8; 32], src: &[u8; 4], dst: &[u8; 4], plaintext: &[u8]) 
 /// Opens a body sealed by the claimed origin. Failure means the
 /// claimed origin did not send this (wrong pairwise key) or the
 /// body was tampered with — callers MUST drop the packet.
-pub fn e2e_open(key: &[u8; 32], src: &[u8; 4], dst: &[u8; 4], data: &[u8]) -> Result<Vec<u8>> {
+pub fn e2e_open(key: &[u8; 32], kind: u8, src: &[u8; 4], dst: &[u8; 4], data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 12 + 16 {
         return Err(anyhow!("end-to-end body too short"));
     }
     let (nonce, ct) = data.split_at(12);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let mut aad = Vec::with_capacity(8);
+    let mut aad = Vec::with_capacity(9);
+    aad.push(kind);
     aad.extend_from_slice(src);
     aad.extend_from_slice(dst);
     cipher
@@ -691,21 +698,26 @@ mod tests {
         let bob_pub = PublicKey::from(&bob);
         let src = [100, 64, 0, 1];
         let dst = [100, 64, 0, 2];
-        let k_ab = e2e_key(&alice, &bob_pub).unwrap();
-        let sealed = e2e_seal(&k_ab, &src, &dst, b"secret for bob").unwrap();
-        // Bob derives the same pairwise key and opens it.
-        let k_ba = e2e_key(&bob, &alice_pub).unwrap();
+        // Direction A -> B: both sides derive with sender = Alice.
+        let k_ab = e2e_key(&alice, &bob_pub, &alice_pub).unwrap();
+        let sealed = e2e_seal(&k_ab, 1, &src, &dst, b"secret for bob").unwrap();
+        let k_ba = e2e_key(&bob, &alice_pub, &alice_pub).unwrap();
         assert_eq!(k_ab, k_ba);
-        assert_eq!(e2e_open(&k_ba, &src, &dst, &sealed).unwrap(), b"secret for bob");
+        assert_eq!(e2e_open(&k_ba, 1, &src, &dst, &sealed).unwrap(), b"secret for bob");
+        // The reverse direction is a DIFFERENT key.
+        let k_rev = e2e_key(&alice, &bob_pub, &bob_pub).unwrap();
+        assert_ne!(k_ab, k_rev);
+        // A relay re-labelling the kind is caught by the AAD.
+        assert!(e2e_open(&k_ba, 7, &src, &dst, &sealed).is_err());
         // Mallory claiming Alice's VIP cannot produce a body Bob
         // accepts: her pairwise key with Bob differs.
-        let k_mb = e2e_key(&mallory, &bob_pub).unwrap();
-        let forged = e2e_seal(&k_mb, &src, &dst, b"forged").unwrap();
-        assert!(e2e_open(&k_ba, &src, &dst, &forged).is_err());
+        let k_mb = e2e_key(&mallory, &bob_pub, &alice_pub).unwrap();
+        let forged = e2e_seal(&k_mb, 1, &src, &dst, b"forged").unwrap();
+        assert!(e2e_open(&k_ba, 1, &src, &dst, &forged).is_err());
         // And a relay that flips a bit is caught.
         let mut tampered = sealed.clone();
         tampered[20] ^= 1;
-        assert!(e2e_open(&k_ba, &src, &dst, &tampered).is_err());
+        assert!(e2e_open(&k_ba, 1, &src, &dst, &tampered).is_err());
     }
 
     #[test]

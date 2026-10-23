@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kronos_daemon::config::{
-    control_url_allows_tokens, proposed_virtual_ip, Config, Identity, NodeState,
+    control_url_allows_tokens, proposed_virtual_ip, write_file_atomic, Config, Identity,
+    NodeState,
 };
 use kronos_daemon::control_client::{discover_endpoint, ControlClient};
 use kronos_daemon::dns;
@@ -168,9 +169,11 @@ async fn run_up(cfg: Config) -> Result<()> {
         }
     }
     let mut registration = None;
+    let mut winning_was_persisted = false;
     for (i, token) in candidates.iter().enumerate() {
         match client.register(&register_req, Some(token)).await {
             Ok(r) => {
+                winning_was_persisted = persisted_token.as_deref() == Some(token.as_str());
                 registration = Some((r, Some(token.clone())));
                 break;
             }
@@ -195,15 +198,30 @@ async fn run_up(cfg: Config) -> Result<()> {
                 "[kronos] registered with control plane as {} (vip {})",
                 r.node_id, r.assigned_virtual_ip
             );
-            // If the plane issued (or rotated) a token, persist it; else
-            // keep the one we presented.
-            let effective_token = r.node_token.clone().or(presented_token);
+            // Persist ONLY a token the plane issued in this
+            // response — or the presented credential when it was
+            // our own persisted node token. A presented CONFIG
+            // token (admin or enrollment) is a provisioning
+            // credential, never our node token: writing it into
+            // node_state.json would put the operator credential
+            // at rest as this node's identity (and quietly
+            // undermine a later revocation of this node).
+            let effective_token = r.node_token.clone().or_else(|| if winning_was_persisted { presented_token.clone() } else { None });
             NodeState {
                 node_id: r.node_id.clone(),
                 virtual_ip: r.assigned_virtual_ip.clone(),
                 node_token: effective_token.clone(),
             }
             .save(&cfg.state_dir)?;
+            if effective_token.is_none() {
+                eprintln!(
+                    "[kronos] WARNING: the control plane issued no node token for this \
+                     registration and no persisted token was presented, so heartbeats \
+                     will be rejected. If node_state.json was lost, revoke this node in \
+                     the control plane and restart so it registers fresh and receives \
+                     a new token."
+                );
+            }
             Some((r, effective_token))
         }
         None => {
@@ -330,6 +348,7 @@ async fn run_up(cfg: Config) -> Result<()> {
     let hb_names = name_table.clone();
     let hb_self_name = cfg.node_name.clone();
     let hb_telemetry = telemetry.clone();
+    let hb_dir = cfg.state_dir.clone();
     let heartbeat_secs = cfg.heartbeat_secs;
     let heartbeat_handle = tokio::spawn(async move {
         if let Some(node_id) = node_id {
@@ -337,6 +356,14 @@ async fn run_up(cfg: Config) -> Result<()> {
             let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
             loop {
                 interval.tick().await;
+                // Re-read the persisted token each cycle (the
+                // ACL loop already does): an external
+                // re-registration or rotation is picked up
+                // without a restart. Falls back to the token
+                // from this run's registration.
+                let current_token = NodeState::load(&hb_dir)
+                    .and_then(|s| s.node_token)
+                    .or_else(|| node_token.clone());
                 let snap = hb_telemetry.snapshot();
                 let payload = HeartbeatPayload {
                     node_id: node_id.clone(),
@@ -350,7 +377,7 @@ async fn run_up(cfg: Config) -> Result<()> {
                     established_peers: hb_tunnel.established_peer_keys(),
                 };
                 match heartbeat_client
-                    .heartbeat(&node_id, &payload, node_token.as_deref())
+                    .heartbeat(&node_id, &payload, current_token.as_deref())
                     .await
                 {
                     Ok(resp) => {
@@ -377,20 +404,42 @@ async fn run_up(cfg: Config) -> Result<()> {
             // node token (re-read each cycle so a re-registration
             // is picked up without a restart).
             let token = NodeState::load(&acl_dir).and_then(|s| s.node_token);
-            if let Ok(policy) = acl_client.fetch_acls(token.as_deref()).await {
-                if policy.version != last_version {
-                    last_version = policy.version;
-                    // Enforce in the data plane, and keep the on-disk
-                    // cache for inspection/restart continuity.
-                    acl_tunnel.update_acls(&policy.rules);
-                    let _ = std::fs::write(
-                        acl_dir.join("acls.json"),
-                        serde_json::to_string_pretty(&policy).unwrap_or_default(),
-                    );
+            match acl_client.fetch_acls(token.as_deref()).await {
+                Ok(policy) => {
+                    if policy.version != last_version {
+                        last_version = policy.version;
+                        // Enforce in the data plane, and keep the
+                        // on-disk cache for inspection/restart
+                        // continuity. The cache write is atomic:
+                        // a crash must not leave a torn or empty
+                        // policy file behind.
+                        acl_tunnel.update_acls(&policy.rules);
+                        match serde_json::to_string_pretty(&policy) {
+                            Ok(text) => {
+                                if let Err(e) =
+                                    write_file_atomic(&acl_dir.join("acls.json"), &text)
+                                {
+                                    eprintln!("[kronos] ACL cache write failed: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[kronos] ACL policy serialization failed: {e}")
+                            }
+                        }
+                        eprintln!(
+                            "[kronos] ACL policy updated to version {} ({} rules)",
+                            policy.version,
+                            policy.rules.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Never silent: a revoked credential, a dead
+                    // plane or a TLS failure must be visible —
+                    // the node keeps enforcing the last known
+                    // policy meanwhile.
                     eprintln!(
-                        "[kronos] ACL policy updated to version {} ({} rules)",
-                        policy.version,
-                        policy.rules.len()
+                        "[kronos] ACL sync failed (keeping version {last_version}): {e}"
                     );
                 }
             }
@@ -442,6 +491,15 @@ async fn run_status(cfg: Config) -> Result<()> {
     }
     let token = state.as_ref().and_then(|s| s.node_token.clone());
     let client = ControlClient::new(&cfg.control_url);
+    if !control_url_allows_tokens(&cfg.control_url, cfg.allow_insecure_http) {
+        // Same policy as `up`/`peers`, softened for a status
+        // command: never send the token over remote plaintext
+        // HTTP — show local state and say why the mesh is skipped.
+        println!(
+            "mesh          : not queried (refusing plaintext HTTP to a remote control plane; set KRONOS_ALLOW_INSECURE_HTTP=1 on a trusted network)"
+        );
+        return Ok(());
+    }
     match client.fetch_topology(token.as_deref()).await {
         Ok(topo) => {
             let online = topo.nodes.iter().filter(|n| n.online).count();
@@ -458,6 +516,17 @@ async fn run_status(cfg: Config) -> Result<()> {
 }
 
 async fn run_peers(cfg: Config) -> Result<()> {
+    // Same token-transport policy as `up`: this command presents
+    // the persisted node token, so it must not leak it to a
+    // remote plaintext-HTTP plane either.
+    if !control_url_allows_tokens(&cfg.control_url, cfg.allow_insecure_http) {
+        bail!(
+            "refusing to send the node token to {} over plaintext HTTP: \
+             use an https:// control URL or a loopback address, or set \
+             KRONOS_ALLOW_INSECURE_HTTP=1 on a trusted network",
+            cfg.control_url
+        );
+    }
     let client = ControlClient::new(&cfg.control_url);
     let token = NodeState::load(&cfg.state_dir).and_then(|s| s.node_token);
     let topo = client
@@ -476,7 +545,7 @@ async fn run_peers(cfg: Config) -> Result<()> {
             node.endpoint,
             node.role,
             if node.online { "online" } else { "offline" },
-            &node.fingerprint[..16]
+            node.fingerprint.chars().take(16).collect::<String>()
         );
     }
     Ok(())

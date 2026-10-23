@@ -129,6 +129,12 @@ pub fn validate_ebpf_object(bytes: &[u8]) -> Result<(), String> {
     if &bytes[0..4] != b"\x7fELF" {
         return Err("object is not an ELF file".to_string());
     }
+    // EI_CLASS at offset 4: 1 = 32-bit, 2 = 64-bit. (The doc
+    // comment above always claimed this check; the code only
+    // caught up in the Round-8 review.)
+    if bytes[4] != 1 && bytes[4] != 2 {
+        return Err(format!("ELF EI_CLASS is {}, expected 1 or 2", bytes[4]));
+    }
     // e_machine: little-endian u16 at offset 18 (eBPF objects are LE).
     let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
     if machine != 247 {
@@ -395,9 +401,13 @@ mod tests {
     fn object_validation_accepts_ebpf_elf_and_rejects_others() {
         let mut elf = vec![0u8; 64];
         elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // EI_CLASS: 64-bit (the validator checks it since Round 8)
         elf[18] = 247;
         elf[19] = 0;
         assert!(validate_ebpf_object(&elf).is_ok());
+        let mut bad_class = elf.clone();
+        bad_class[4] = 9;
+        assert!(validate_ebpf_object(&bad_class).is_err());
         assert!(validate_ebpf_object(b"not an elf at all, padded to length").is_err());
         let mut wrong_machine = elf.clone();
         wrong_machine[18] = 62; // EM_X86_64

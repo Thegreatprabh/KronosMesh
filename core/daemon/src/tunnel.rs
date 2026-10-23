@@ -103,6 +103,16 @@ const INIT_MAX_AGE_MS: u64 = 120_000;
 /// two X25519 DH operations before the sender is authenticated, so
 /// unauthenticated floods are capped cheaply, before any DH happens.
 const INIT_RATE_LIMIT: u32 = 30;
+/// Aggregate proof-less INIT budget per second across ALL
+/// sources. The per-source limit alone lets a rotating-source
+/// flood buy unbounded X25519 work (30/s per fresh address);
+/// past this aggregate, every source needs a cookie proof —
+/// WireGuard's "cookie mode under load".
+const INIT_GLOBAL_LIMIT: u32 = 300;
+/// Aggregate budget for proof-carrying INITs: far higher (the
+/// sender proved address ownership), still bounded so a cookie
+/// holder cannot monopolize handshake CPU either.
+const INIT_GLOBAL_PROOF_LIMIT: u32 = 1500;
 /// The per-source INIT rate table is pruned once it grows past this
 /// many sources, so the guard itself cannot be memory-flooded.
 const INIT_RATE_TABLE_MAX: usize = 4096;
@@ -443,7 +453,18 @@ struct Peer {
     /// (millis). Enforces strictly increasing INIT freshness.
     last_init_ms: Mutex<u64>,
     latency_ms: Mutex<f64>,
+    /// Last AUTHENTICATED INBOUND frame from this peer. Never
+    /// updated on send — silence-based liveness reads this.
     last_activity: Mutex<Instant>,
+}
+
+/// Coalescing state for the freshness writer: at most one
+/// writer thread exists; persists that arrive while it writes
+/// replace `pending`, and the writer loops until no newer
+/// snapshot is waiting (see Tunnel::persist_freshness).
+struct FreshnessWriter {
+    pending: Option<(std::path::PathBuf, String)>,
+    active: bool,
 }
 
 /// On-disk INIT freshness state (see Tunnel::set_freshness_dir).
@@ -670,10 +691,13 @@ pub struct Tunnel<T: Transport> {
     /// replay window.
     init_floor_default: Mutex<u64>,
     /// Serializes the background freshness writer threads.
-    freshness_write_lock: std::sync::Arc<Mutex<()>>,
+    freshness_writer: std::sync::Arc<Mutex<FreshnessWriter>>,
     freshness_file: Mutex<Option<std::path::PathBuf>>,
     /// Per-source INIT rate-limit windows (pre-auth DoS guard).
     init_rate: Mutex<HashMap<SocketAddr, (Instant, u32)>>,
+    /// Aggregate initiation budget: (window start, proof-less
+    /// count, proof count) over a 1 s window, across all sources.
+    init_global: Mutex<(Instant, u32, u32)>,
     /// WireGuard-style cookie state. `cookie_jar` holds our
     /// rotating responder secret (current + previous); a peer
     /// that exceeds the INIT rate limit is sent a cookie bound
@@ -769,9 +793,13 @@ impl<T: Transport> Tunnel<T> {
             rekey_after_secs: std::sync::atomic::AtomicU64::new(REKEY_AFTER_SECS),
             init_floors: Mutex::new(HashMap::new()),
             init_floor_default: Mutex::new(0),
-            freshness_write_lock: std::sync::Arc::new(Mutex::new(())),
+            freshness_writer: std::sync::Arc::new(Mutex::new(FreshnessWriter {
+                pending: None,
+                active: false,
+            })),
             freshness_file: Mutex::new(None),
             init_rate: Mutex::new(HashMap::new()),
+            init_global: Mutex::new((Instant::now(), 0, 0)),
             cookie_jar: Mutex::new(CookieJar::new()),
             cookies_out: Mutex::new(HashMap::new()),
             cookie_sent: Mutex::new(HashMap::new()),
@@ -888,14 +916,40 @@ impl<T: Transport> Tunnel<T> {
             Ok(t) => t,
             Err(_) => return,
         };
-        // The write lock lives in an Arc-shared spot: persist
-        // calls race from many tasks; each write is atomic
-        // (temp file + fsync + rename + dir fsync), so a crash
-        // leaves either the old or the new complete file —
-        // never a torn one that would reopen the replay window.
-        let lock = self.freshness_write_lock.clone();
-        std::thread::spawn(move || {
-            let _guard = lock.lock().unwrap();
+        // Coalesced writer: persists can arrive far faster than
+        // fsync completes (every accepted INIT persists). Instead
+        // of one thread per call queueing on a lock, a single
+        // writer thread drains the LATEST snapshot: calls that
+        // arrive while it writes just replace the pending
+        // snapshot. Each write is atomic (temp file + fsync +
+        // rename + dir fsync), so a crash leaves either the old
+        // or the new complete file — never a torn one that
+        // would reopen the replay window.
+        let spawn_writer = {
+            let mut w = self.freshness_writer.lock().unwrap();
+            w.pending = Some((path, text));
+            if w.active {
+                false
+            } else {
+                w.active = true;
+                true
+            }
+        };
+        if !spawn_writer {
+            return;
+        }
+        let writer = self.freshness_writer.clone();
+        std::thread::spawn(move || loop {
+            let (path, text) = {
+                let mut w = writer.lock().unwrap();
+                match w.pending.take() {
+                    Some(v) => v,
+                    None => {
+                        w.active = false;
+                        return;
+                    }
+                }
+            };
             let tmp = path.with_extension("json.tmp");
             let write = (|| -> std::io::Result<()> {
                 use std::io::Write;
@@ -1059,12 +1113,22 @@ impl<T: Transport> Tunnel<T> {
     /// `dst_vip` (the final destination, not the next hop),
     /// derived from the pairwise static X25519 secret. `None`
     /// when the destination is not a known peer.
-    fn e2e_key_for(&self, dst_vip: &[u8; 4]) -> Option<[u8; 32]> {
+    /// The directional E2E key for traffic involving the peer at
+    /// `other_vip`. `from_local` = true derives the key for traffic
+    /// WE originate to that peer (sender = us); false derives the
+    /// key for traffic that peer originates to us (sender = them).
+    /// The two directions use different keys.
+    fn e2e_key_for(&self, other_vip: &[u8; 4], from_local: bool) -> Option<[u8; 32]> {
         let peer = {
             let peers = self.peers.lock().unwrap();
-            peers.values().find(|p| p.vip == *dst_vip).cloned()
+            peers.values().find(|p| p.vip == *other_vip).cloned()
         }?;
-        crate::crypto::e2e_key(&self.identity.secret(), &peer.public).ok()
+        let sender = if from_local {
+            self.identity.public
+        } else {
+            peer.public
+        };
+        crate::crypto::e2e_key(&self.identity.secret(), &peer.public, &sender).ok()
     }
 
     /// Public keys of peers with established encrypted sessions; the
@@ -1370,9 +1434,9 @@ impl<T: Transport> Tunnel<T> {
                     | KIND_STREAM_RESET
             ) {
             let key = self
-                .e2e_key_for(&dst_vip)
+                .e2e_key_for(&dst_vip, true)
                 .ok_or_else(|| anyhow!("no peer key for {}", octets_to_vip(&dst_vip)))?;
-            sealed_body = crate::crypto::e2e_seal(&key, &src_vip, &dst_vip, body)?;
+            sealed_body = crate::crypto::e2e_seal(&key, kind, &src_vip, &dst_vip, body)?;
             &sealed_body
         } else {
             body
@@ -1416,7 +1480,11 @@ impl<T: Transport> Tunnel<T> {
         frame.extend_from_slice(&remote_index.to_le_bytes());
         frame.extend_from_slice(&counter.to_le_bytes());
         frame.extend_from_slice(&ciphertext);
-        *peer.last_activity.lock().unwrap() = Instant::now();
+        // NOTE: last_activity is deliberately NOT refreshed here.
+        // It records the last AUTHENTICATED INBOUND frame only;
+        // the dead-peer reaper and keepalive probe read it as
+        // silence, and refreshing it on send (e.g. with our own
+        // 10 s PINGs) would make a vanished peer look alive.
         self.send_raw(endpoint, &frame).await;
         self.telemetry.packets_out.fetch_add(0, Ordering::Relaxed); // counted in send_raw
         Ok(())
@@ -1920,6 +1988,10 @@ impl<T: Transport> Tunnel<T> {
                 if body.len() < 8 {
                     return;
                 }
+                if body.len() - 8 > STREAM_FRAME_PAYLOAD {
+                    self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 let stream_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
                 let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
                 if self.find_in_stream(&src, stream_id).is_none()
@@ -2357,6 +2429,20 @@ impl<T: Transport> Tunnel<T> {
 
     /// mac2: the proof a challenged initiator attaches to its
     /// retried INIT — HMAC-SHA256(cookie, init frame)[..16].
+    /// Constant-time equality for MAC comparison (the rest of
+    /// the system compares credentials in constant time; the
+    /// cookie proof gets the same treatment).
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for i in 0..a.len() {
+            diff |= a[i] ^ b[i];
+        }
+        diff == 0
+    }
+
     fn mac2(cookie: &[u8; 16], init_frame: &[u8]) -> [u8; 16] {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -2382,7 +2468,7 @@ impl<T: Transport> Tunnel<T> {
         let jar = self.cookie_jar.lock().unwrap();
         for secret in std::iter::once(&jar.current).chain(jar.prev.iter()) {
             let cookie = Self::cookie_value(secret, from);
-            if Self::mac2(&cookie, init) == presented {
+            if Self::ct_eq(&Self::mac2(&cookie, init), presented) {
                 return true;
             }
         }
@@ -2409,6 +2495,7 @@ impl<T: Transport> Tunnel<T> {
         {
             let mut sent = self.cookie_sent.lock().unwrap();
             let now = Instant::now();
+            sent.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
             if let Some(t) = sent.get(&from) {
                 if now.duration_since(*t) < Duration::from_secs(1) {
                     return;
@@ -2434,10 +2521,21 @@ impl<T: Transport> Tunnel<T> {
         }
         let mut cookie = [0u8; 16];
         cookie.copy_from_slice(&frame[4..20]);
-        self.cookies_out
-            .lock()
-            .unwrap()
-            .insert(from, (cookie, Instant::now()));
+        let known = {
+            let peers = self.peers.lock().unwrap();
+            peers
+                .values()
+                .any(|p| p.endpoint.lock().unwrap().map(|e| e == from).unwrap_or(false))
+        };
+        if !known {
+            self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        {
+            let mut out = self.cookies_out.lock().unwrap();
+            out.retain(|_, (_, at)| at.elapsed() < COOKIE_TTL);
+            out.insert(from, (cookie, Instant::now()));
+        }
         let peers: Vec<Arc<Peer>> = self.peers.lock().unwrap().values().cloned().collect();
         for peer in peers {
             if peer.endpoint.lock().unwrap().map(|e| e == from).unwrap_or(false) {
@@ -2452,11 +2550,37 @@ impl<T: Transport> Tunnel<T> {
         }
     }
 
+    /// Counts one initiation against the aggregate budget and
+    /// reports whether it may proceed. Windows are 1 s, aligned
+    /// to first use.
+    fn init_global_ok(&self, proof: bool) -> bool {
+        let mut g = self.init_global.lock().unwrap();
+        if Instant::now().duration_since(g.0) > Duration::from_secs(1) {
+            *g = (Instant::now(), 0, 0);
+        }
+        if proof {
+            g.2 += 1;
+            g.2 <= INIT_GLOBAL_PROOF_LIMIT
+        } else {
+            g.1 += 1;
+            g.1 <= INIT_GLOBAL_LIMIT
+        }
+    }
+
     fn init_rate_ok(&self, from: SocketAddr) -> bool {
         let mut rl = self.init_rate.lock().unwrap();
         if rl.len() > INIT_RATE_TABLE_MAX {
             let now = Instant::now();
             rl.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(2));
+        }
+        // The cap must be a cap: during a rotating-source flood
+        // every entry is fresh, so age-based pruning evicts
+        // nothing. A NEW source arriving at a full table is
+        // treated as over-limit (it gets a cookie challenge
+        // instead of handshake CPU) rather than growing the
+        // table further.
+        if rl.len() >= INIT_RATE_TABLE_MAX && !rl.contains_key(&from) {
+            return false;
         }
         let e = rl.entry(from).or_insert((Instant::now(), 0));
         if Instant::now().duration_since(e.0) > Duration::from_secs(1) {
@@ -2486,19 +2610,25 @@ impl<T: Transport> Tunnel<T> {
         if frame.len() < 8 {
             return;
         }
-        // Pre-auth flood gate, BEFORE any X25519 work. An INIT
-        // carrying a valid cookie proof (mac2) is accepted
-        // regardless of rate — its source proved it can receive
-        // at its claimed address. Without one, the per-source
-        // rate limit applies; past it, the source is challenged
-        // with a COOKIE frame and the INIT is dropped.
+        // Pre-auth flood gate, BEFORE any X25519 work. A valid
+        // cookie proof (mac2) means the source proved it can
+        // receive at its claimed address: it is counted against
+        // the generous aggregate proof budget and proceeds.
+        // Without a valid proof the INIT is proof-less — an
+        // INVALID proof is treated exactly like none, so a
+        // poisoned cookie cache can never block a handshake that
+        // would otherwise pass — and must satisfy BOTH the
+        // per-source rate limit and the aggregate proof-less
+        // budget. Past either, the source is challenged with a
+        // COOKIE frame and the INIT is dropped.
         let has_proof = frame.len() == INIT_FRAME_LEN + MAC2_LEN;
-        if has_proof {
-            if !self.cookie_proof_valid(&from, frame) {
+        let proof_ok = has_proof && self.cookie_proof_valid(&from, frame);
+        if proof_ok {
+            if !self.init_global_ok(true) {
                 self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        } else if !self.init_rate_ok(from) {
+        } else if !self.init_rate_ok(from) || !self.init_global_ok(false) {
             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
             self.send_cookie_challenge(from).await;
             return;
@@ -2775,14 +2905,14 @@ impl<T: Transport> Tunnel<T> {
                     // the node that owns src_vip. A node claiming
                     // another's VIP fails here and is dropped,
                     // whatever role the claimed identity has.
-                    let key = match self.e2e_key_for(&src_vip) {
+                    let key = match self.e2e_key_for(&src_vip, false) {
                         Some(k) => k,
                         None => {
                             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
                     };
-                    let body = match crate::crypto::e2e_open(&key, &src_vip, &dst_vip, &body) {
+                    let body = match crate::crypto::e2e_open(&key, kind, &src_vip, &dst_vip, &body) {
                         Ok(b) => b,
                         Err(_) => {
                             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -2844,14 +2974,14 @@ impl<T: Transport> Tunnel<T> {
                     // path, verified BEFORE any stream state is
                     // created or policy is evaluated: a forged
                     // source dies here.
-                    let key = match self.e2e_key_for(&src_vip) {
+                    let key = match self.e2e_key_for(&src_vip, false) {
                         Some(k) => k,
                         None => {
                             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
                     };
-                    let body = match crate::crypto::e2e_open(&key, &src_vip, &dst_vip, &body) {
+                    let body = match crate::crypto::e2e_open(&key, kind, &src_vip, &dst_vip, &body) {
                         Ok(b) => b,
                         Err(_) => {
                             self.telemetry.drops.fetch_add(1, Ordering::Relaxed);
@@ -3314,9 +3444,9 @@ mod tests {
         let craft_frame = |a: &Arc<Tunnel<MemoryTransport>>, ttl: u8, body: &[u8]| -> Vec<u8> {
             // The body is end-to-end sealed A -> C, exactly as the
             // real send path does; B can only forward it opaquely.
-            let key = a.e2e_key_for(&[100, 64, 0, 13]).unwrap();
+            let key = a.e2e_key_for(&[100, 64, 0, 13], true).unwrap();
             let sealed =
-                crate::crypto::e2e_seal(&key, &[100, 64, 0, 11], &[100, 64, 0, 13], body).unwrap();
+                crate::crypto::e2e_seal(&key, KIND_DATA, &[100, 64, 0, 11], &[100, 64, 0, 13], body).unwrap();
             let mut inner = vec![KIND_DATA, ttl];
             inner.extend_from_slice(&[100, 64, 0, 11]); // src = A
             inner.extend_from_slice(&[100, 64, 0, 13]); // dst = C
@@ -4364,9 +4494,10 @@ mod tests {
         // the V<->D key, so it must fail and drop.
         let drops_before = tel_d.snapshot().drops;
         let frame = {
-            let key = m.e2e_key_for(&[100, 64, 40, 3]).unwrap();
+            let key = m.e2e_key_for(&[100, 64, 40, 3], true).unwrap();
             let sealed = crate::crypto::e2e_seal(
                 &key,
+                KIND_DATA,
                 &[100, 64, 40, 1],
                 &[100, 64, 40, 3],
                 b"i am totally v",
@@ -4737,4 +4868,116 @@ mod tests {
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
     }
+    /// Round 8 regression: outbound traffic must NOT refresh a
+    /// peer's silence clock. Before the fix, the send path
+    /// stamped last_activity on every frame and the periodic
+    /// PINGs kept it permanently fresh, so a vanished peer was
+    /// never considered dead and the Round-6 reaper never fired
+    /// for established peers.
+    #[tokio::test]
+    async fn outbound_traffic_does_not_revive_a_silent_peer() {
+        let hub = MemoryHub::new();
+        let (a, _rx_a, id_a, _t) = make_node(&hub, 6631, "100.64.31.1", "edge").await;
+        let (b, _rx_b, id_b, _t2) = make_node(&hub, 6632, "100.64.31.2", "db").await;
+        a.add_peer(&id_b.public_hex(), "100.64.31.2", Some(b.local_addr()), "db");
+        b.add_peer(&id_a.public_hex(), "100.64.31.1", Some(a.local_addr()), "edge");
+        a.spawn_loops();
+        b.spawn_loops();
+        a.send_data("100.64.31.2", b"warmup").await.unwrap();
+        backdate_peer(&a, &id_b.public_hex());
+        assert!(a.peer_is_dead("100.64.31.2"));
+        // A keeps SENDING; raw data draws no tunnel-level reply,
+        // so nothing inbound can legitimately refresh the clock.
+        a.send_data("100.64.31.2", b"still there?").await.unwrap();
+        assert!(
+            a.peer_is_dead("100.64.31.2"),
+            "outbound sends must not reset the silence clock"
+        );
+    }
+
+    /// Round 8 regression: COOKIE frames are unauthenticated, so
+    /// an attacker can plant a forged cookie in our cache for a
+    /// peer's endpoint. Our next INIT then carries an invalid
+    /// proof — the responder must treat it as proof-less (rate
+    /// path), never drop it outright.
+    #[tokio::test]
+    async fn poisoned_cookie_cache_cannot_block_handshakes() {
+        let hub = MemoryHub::new();
+        let (c, _rx_c, id_c, _t) = make_node(&hub, 6641, "100.64.32.1", "edge").await;
+        let (d, mut rx_d, id_d, _t2) = make_node(&hub, 6642, "100.64.32.2", "db").await;
+        c.add_peer(&id_d.public_hex(), "100.64.32.2", Some(d.local_addr()), "db");
+        d.add_peer(&id_c.public_hex(), "100.64.32.1", Some(c.local_addr()), "edge");
+        c.spawn_loops();
+        d.spawn_loops();
+        c.cookies_out
+            .lock()
+            .unwrap()
+            .insert(d.local_addr(), ([0xEE; 16], Instant::now()));
+        c.send_data("100.64.32.2", b"through").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_d.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"through");
+    }
+
+    /// Round 8: the per-source limit alone gives every rotating
+    /// source a fresh handshake-CPU budget. Once the AGGREGATE
+    /// proof-less budget is spent, even a fresh, well-behaved
+    /// source is challenged; its cookie retry then goes through.
+    #[tokio::test]
+    async fn aggregate_budget_forces_cookie_mode_for_fresh_sources() {
+        let hub = MemoryHub::new();
+        let (e, _rx_e, id_e, _t) = make_node(&hub, 6651, "100.64.33.1", "edge").await;
+        let (f, mut rx_f, id_f, _t2) = make_node(&hub, 6652, "100.64.33.2", "db").await;
+        e.add_peer(&id_f.public_hex(), "100.64.33.2", Some(f.local_addr()), "db");
+        f.add_peer(&id_e.public_hex(), "100.64.33.1", Some(e.local_addr()), "edge");
+        e.spawn_loops();
+        f.spawn_loops();
+        *f.init_global.lock().unwrap() = (Instant::now(), INIT_GLOBAL_LIMIT, 0);
+        let _ = e.send_data("100.64.33.2", b"knock").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            e.cookies_out.lock().unwrap().contains_key(&f.local_addr()),
+            "a fresh source past the aggregate budget must be challenged with a cookie"
+        );
+        e.send_data("100.64.33.2", b"knock").await.unwrap();
+        let (_s, p) = tokio::time::timeout(Duration::from_secs(5), rx_f.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(p, b"knock");
+    }
+
+    /// Round 8: inbound stream DATA is bounded by BYTES, not just
+    /// frame count — a payload larger than the send-side chunk
+    /// size is non-conformant and must be dropped, not buffered.
+    #[tokio::test]
+    async fn oversized_stream_data_frame_is_dropped_not_buffered() {
+        let hub = MemoryHub::new();
+        let (a, _rx, _id_a, _t) = make_node(&hub, 6661, "100.64.34.1", "edge").await;
+        let _in = a.in_stream("100.64.34.2", 9);
+        let mut body = Vec::new();
+        body.extend_from_slice(&9u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&vec![0xAA; STREAM_FRAME_PAYLOAD + 1]);
+        a.handle_stream_frame(KIND_STREAM_DATA, &[100, 64, 34, 2], "node".to_string(), &body)
+            .await;
+        assert!(
+            a.next_stream_data("100.64.34.2", 9).await.is_none(),
+            "oversized payload must not be buffered"
+        );
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&9u32.to_be_bytes());
+        ok.extend_from_slice(&0u32.to_be_bytes());
+        ok.extend_from_slice(&vec![0xBB; STREAM_FRAME_PAYLOAD]);
+        a.handle_stream_frame(KIND_STREAM_DATA, &[100, 64, 34, 2], "node".to_string(), &ok)
+            .await;
+        let got = a
+            .next_stream_data("100.64.34.2", 9)
+            .await
+            .expect("conformant payload must be delivered");
+        assert_eq!(got.len(), STREAM_FRAME_PAYLOAD);
+    }
+
 }
