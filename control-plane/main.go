@@ -114,6 +114,12 @@ func main() {
 	if devOpen {
 		log.Printf("WARNING: KRONOS_DEV_OPEN_ADMIN=1 - operator authentication is DISABLED (local development only). ACL changes and new-node registration are unauthenticated; node tokens are still enforced for heartbeats and re-registration.")
 	}
+	// Ship in release mode by default: Gin's debug mode prints
+	// its route table and development warnings an operator did
+	// not ask for. An explicit GIN_MODE still wins.
+	if os.Getenv("GIN_MODE") == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 	router := gin.Default()
 	router.Use(corsMiddleware())
 	router.Use(bodyLimitMiddleware())

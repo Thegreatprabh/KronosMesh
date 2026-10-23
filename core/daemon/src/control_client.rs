@@ -73,10 +73,12 @@ impl ControlClient {
         resp.json().await.context("decoding heartbeat response")
     }
 
-    pub async fn fetch_acls(&self) -> Result<AclPolicyResponse> {
-        let resp = self
-            .http
-            .get(format!("{}/api/v1/acls", self.base_url))
+    pub async fn fetch_acls(&self, token: Option<&str>) -> Result<AclPolicyResponse> {
+        let mut rb = self.http.get(format!("{}/api/v1/acls", self.base_url));
+        if let Some(t) = token {
+            rb = rb.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = rb
             .send()
             .await
             .context("ACL fetch failed")?
@@ -85,10 +87,12 @@ impl ControlClient {
         resp.json().await.context("decoding ACL response")
     }
 
-    pub async fn fetch_topology(&self) -> Result<MeshTopology> {
-        let resp = self
-            .http
-            .get(format!("{}/api/v1/topology", self.base_url))
+    pub async fn fetch_topology(&self, token: Option<&str>) -> Result<MeshTopology> {
+        let mut rb = self.http.get(format!("{}/api/v1/topology", self.base_url));
+        if let Some(t) = token {
+            rb = rb.header("Authorization", format!("Bearer {t}"));
+        }
+        let resp = rb
             .send()
             .await
             .context("topology fetch failed")?

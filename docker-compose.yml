@@ -17,14 +17,18 @@ services:
       # KRONOS_DEV_OPEN_ADMIN: "1"
       KRONOS_ADMIN_TOKEN: "${KRONOS_ADMIN_TOKEN:-}"
     ports:
-      - "8080:8080"
+      # Loopback only: this API carries bearer tokens and full
+      # mesh topology. The dashboard (in the operator's local
+      # browser) reaches it there; exposing it beyond the host
+      # is a deliberate step that must terminate TLS first.
+      - "127.0.0.1:8080:8080"
     depends_on:
       - redis
 
   dashboard:
     build: ./apps/dashboard
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
     depends_on:
       - control-plane
 

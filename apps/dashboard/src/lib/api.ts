@@ -42,7 +42,12 @@ function toLoadError(e: unknown): LoadError {
 async function getJson<T>(path: string): Promise<T> {
   let resp: Response;
   try {
-    resp = await fetch(`${CONTROL_URL}${path}`);
+    // Reads are credentialed too: the control plane gates
+    // topology/ACL responses behind the admin or a node token,
+    // so present the stored operator token when one is set.
+    resp = await fetch(`${CONTROL_URL}${path}`, {
+      headers: { ...authHeaders() },
+    });
   } catch (e) {
     throw new ApiError(
       'network',

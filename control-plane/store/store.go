@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ type Store interface {
 	RegisterNode(req *models.NodeRegisterRequest, now time.Time) (*models.PeerNode, string, error)
 	Heartbeat(nodeID string, hb *models.HeartbeatPayload, token string, now time.Time) (*models.PeerNode, error)
 	KeyExists(publicKey string) bool
+	AnyNodeTokenValid(token string) bool
 	ListNodes() []models.PeerNode
 	Topology(now time.Time) models.MeshTopology
 	ListAcls() models.AclPolicyResponse
@@ -76,6 +78,38 @@ var ErrUnauthorized = errors.New("unauthorized: invalid or missing node token")
 
 // ErrUnknownNode is returned for operations addressed to a missing node.
 var ErrUnknownNode = errors.New("unknown node")
+
+// tokenHashMatches compares a presented token's hash with the
+// stored hash in constant time. The compared values are hashes of
+// a 256-bit random token, so the practical timing risk was already
+// minimal — this keeps credential checks uniformly constant-time.
+func tokenHashMatches(presented, storedHash string) bool {
+	if storedHash == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(hashToken(presented)), []byte(storedHash)) == 1
+}
+
+// AnyNodeTokenValid reports whether the presented bearer token
+// belongs to ANY registered node. It gates the read endpoints
+// (topology, ACL policy) that daemons legitimately poll with
+// their node token — without leaving full mesh reconnaissance
+// (names, roles, public keys, live endpoints) open to anyone who
+// can reach the port.
+func (s *MemoryStore) AnyNodeTokenValid(token string) bool {
+	if token == "" {
+		return false
+	}
+	h := hashToken(token)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, node := range s.byID {
+		if node.TokenHash != "" && subtle.ConstantTimeCompare([]byte(h), []byte(node.TokenHash)) == 1 {
+			return true
+		}
+	}
+	return false
+}
 
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
@@ -162,7 +196,7 @@ func (s *MemoryStore) RegisterNode(req *models.NodeRegisterRequest, now time.Tim
 	defer s.mu.Unlock()
 	if id, ok := s.byKey[req.PublicKey]; ok {
 		node := s.byID[id]
-		if !req.AdminOverride && (node.TokenHash == "" || hashToken(req.AuthToken) != node.TokenHash) {
+		if !req.AdminOverride && !tokenHashMatches(req.AuthToken, node.TokenHash) {
 			return nil, "", ErrUnauthorized
 		}
 		node.NodeName = req.NodeName
@@ -228,7 +262,7 @@ func (s *MemoryStore) Heartbeat(nodeID string, hb *models.HeartbeatPayload, toke
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownNode, nodeID)
 	}
-	if node.TokenHash == "" || hashToken(token) != node.TokenHash {
+	if !tokenHashMatches(token, node.TokenHash) {
 		return nil, ErrUnauthorized
 	}
 	node.TxBytes = hb.TxBytes

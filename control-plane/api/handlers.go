@@ -81,6 +81,20 @@ func (h *Handlers) Health(c *gin.Context) {
 	})
 }
 
+// requireReader gates the read endpoints that disclose the
+// mesh (topology, ACL policy) behind ANY valid credential — the
+// admin token, or a registered node's bearer token (which is
+// what daemons poll with). When no admin token is configured
+// the plane is in its explicit open posture and reads stay
+// open, mirroring requireAdmin.
+func (h *Handlers) requireReader(c *gin.Context) bool {
+	if h.AdminToken == "" || h.isAdmin(c) || h.Store.AnyNodeTokenValid(bearerToken(c)) {
+		return true
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "admin or node token required"})
+	return false
+}
+
 // RegisterNode handles POST /api/v1/nodes/register.
 func (h *Handlers) RegisterNode(c *gin.Context) {
 	var req models.NodeRegisterRequest
@@ -149,11 +163,17 @@ func (h *Handlers) Heartbeat(c *gin.Context) {
 
 // GetTopology handles GET /api/v1/topology.
 func (h *Handlers) GetTopology(c *gin.Context) {
+	if !h.requireReader(c) {
+		return
+	}
 	c.JSON(http.StatusOK, h.Store.Topology(h.now()))
 }
 
 // ListAcls handles GET /api/v1/acls.
 func (h *Handlers) ListAcls(c *gin.Context) {
+	if !h.requireReader(c) {
+		return
+	}
 	c.JSON(http.StatusOK, h.Store.ListAcls())
 }
 

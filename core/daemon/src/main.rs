@@ -341,7 +341,12 @@ async fn run_up(cfg: Config) -> Result<()> {
         let mut last_version = 0u64;
         loop {
             interval.tick().await;
-            if let Ok(policy) = acl_client.fetch_acls().await {
+            // The policy endpoint requires a credential once an
+            // admin token is configured; present the persisted
+            // node token (re-read each cycle so a re-registration
+            // is picked up without a restart).
+            let token = NodeState::load(&acl_dir).and_then(|s| s.node_token);
+            if let Ok(policy) = acl_client.fetch_acls(token.as_deref()).await {
                 if policy.version != last_version {
                     last_version = policy.version;
                     // Enforce in the data plane, and keep the on-disk
@@ -399,12 +404,14 @@ async fn run_status(cfg: Config) -> Result<()> {
         "proposed vip  : {}",
         proposed_virtual_ip(identity.public.as_bytes())
     );
-    if let Some(state) = NodeState::load(&cfg.state_dir) {
+    let state = NodeState::load(&cfg.state_dir);
+    if let Some(state) = &state {
         println!("node id       : {}", state.node_id);
         println!("assigned vip  : {}", state.virtual_ip);
     }
+    let token = state.as_ref().and_then(|s| s.node_token.clone());
     let client = ControlClient::new(&cfg.control_url);
-    match client.fetch_topology().await {
+    match client.fetch_topology(token.as_deref()).await {
         Ok(topo) => {
             let online = topo.nodes.iter().filter(|n| n.online).count();
             println!(
@@ -421,8 +428,9 @@ async fn run_status(cfg: Config) -> Result<()> {
 
 async fn run_peers(cfg: Config) -> Result<()> {
     let client = ControlClient::new(&cfg.control_url);
+    let token = NodeState::load(&cfg.state_dir).and_then(|s| s.node_token);
     let topo = client
-        .fetch_topology()
+        .fetch_topology(token.as_deref())
         .await
         .context("fetching topology from the control plane")?;
     println!(

@@ -158,6 +158,61 @@ func TestAclEndpoints(t *testing.T) {
 	_ = time.Now // keep time import if unused in future edits
 }
 
+// TestReadEndpointsRequireCredential pins the read gate:
+// with an admin token configured, topology and the ACL policy
+// (full mesh reconnaissance data) require the admin token or a
+// registered node's token; in the open posture (no admin token)
+// they stay readable.
+func TestReadEndpointsRequireCredential(t *testing.T) {
+	r := setupAdminRouter()
+	keyBytes := make([]byte, 32)
+	for i := range keyBytes {
+		keyBytes[i] = byte(11 + i)
+	}
+	const digits = "0123456789abcdef"
+	keyHex := ""
+	for _, v := range keyBytes {
+		keyHex += string([]byte{digits[v>>4], digits[v&0xf]})
+	}
+	regBody := map[string]interface{}{
+		"node_name": "reader-01", "public_key": keyHex,
+		"fingerprint": models.Fingerprint(keyBytes),
+		"virtual_ip":  "100.64.0.12", "endpoint": "198.51.100.7:51820",
+		"role": "node", "nat_type": "nat", "ebpf_probe_passed": false, "version": "1.0.0",
+	}
+	w, body := doJSONToken(t, r, http.MethodPost, "/api/v1/nodes/register", regBody, "test-admin-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("register with admin: status %d: %s", w.Code, body)
+	}
+	var regResp models.NodeRegisterResponse
+	if err := json.Unmarshal(body, &regResp); err != nil {
+		t.Fatal(err)
+	}
+	nodeToken := regResp.NodeToken
+	if nodeToken == "" {
+		t.Fatal("registration must issue a node token")
+	}
+	for _, path := range []string{"/api/v1/topology", "/api/v1/acls"} {
+		if w, _ := doJSON(t, r, http.MethodGet, path, nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("GET %s without credential: status %d, want 401", path, w.Code)
+		}
+		if w, _ := doJSONToken(t, r, http.MethodGet, path, nil, "bogus-token"); w.Code != http.StatusUnauthorized {
+			t.Fatalf("GET %s with bogus token: status %d, want 401", path, w.Code)
+		}
+		if w, _ := doJSONToken(t, r, http.MethodGet, path, nil, nodeToken); w.Code != http.StatusOK {
+			t.Fatalf("GET %s with node token: status %d, want 200", path, w.Code)
+		}
+		if w, _ := doJSONToken(t, r, http.MethodGet, path, nil, "test-admin-token"); w.Code != http.StatusOK {
+			t.Fatalf("GET %s with admin token: status %d, want 200", path, w.Code)
+		}
+	}
+	// Open posture: no admin token configured — reads stay open.
+	open := setupRouter()
+	if w, _ := doJSON(t, open, http.MethodGet, "/api/v1/topology", nil); w.Code != http.StatusOK {
+		t.Fatalf("open posture topology: status %d, want 200", w.Code)
+	}
+}
+
 func setupAdminRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
